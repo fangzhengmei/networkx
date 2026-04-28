@@ -1014,6 +1014,380 @@ def johnson(G, weight="weight"):
    - 清晰的异常类型
    - 负权/负环检测
 
+### 5.5 后端分发装饰器机制：`@_dispatchable`
+
+#### 5.5.1 机制概述
+
+NetworkX 3.0+ 引入了**后端分发机制**，通过 `@nx._dispatchable` 装饰器实现。这一机制允许第三方计算后端（如 `nx-cugraph`、`nx-numba` 等）在运行时替换默认的 Python 实现，以实现**透明的性能加速。
+
+**核心思想**：
+- 将算法实现与 API 接口分离
+- 用户代码无需修改，只需配置后端
+- 支持自动发现和加载第三方后端
+
+#### 5.5.2 装饰器在最短路径模块中的应用
+
+最短路径模块的所有公开接口都挂载了 `@_dispatchable` 装饰器：
+
+```python
+# generic.py - 统一接口层
+@nx._dispatchable
+def has_path(G, source, target): ...
+
+@nx._dispatchable(edge_attrs="weight")
+def shortest_path(G, source=None, target=None, weight=None, method="dijkstra"): ...
+
+# unweighted.py - 无权图算法
+@nx._dispatchable
+def single_source_shortest_path_length(G, source, cutoff=None): ...
+
+# weighted.py - 带权图算法
+@nx._dispatchable(edge_attrs="weight")
+def dijkstra_path(G, source, target, weight="weight"): ...
+
+# dense.py - 稠密图算法
+@nx._dispatchable(edge_attrs="weight")
+def floyd_warshall(G, weight="weight"): ...
+
+# astar.py - A* 算法
+@nx._dispatchable(edge_attrs="weight", preserve_node_attrs="heuristic")
+def astar_path(G, source, target, heuristic=None, weight="weight"): ...
+```
+
+**装饰器参数说明**：
+
+| 参数 | 作用 | 示例 |
+|------|------|------|
+| `graphs | 指定图参数的位置 | `graphs="G"` 或 `graphs={"G": 0}` |
+| `edge_attrs` | 指定边属性参数名 | `edge_attrs="weight"` |
+| `node_attrs` | 指定节点属性参数名 | `node_attrs="heuristic"` |
+| `preserve_*_attrs` | 是否保留属性 | `preserve_node_attrs="heuristic"` |
+| `mutates_input` | 是否修改输入图 | 用于避免自动转换决策 |
+| `returns_graph` | 是否返回图 | 用于返回类型匹配 |
+| `name` | 覆盖分发名称 | 解决命名冲突 |
+
+#### 5.5.3 装饰器的核心功能
+
+`@_dispatchable` 装饰器实现了以下功能：
+
+**1. 函数签名扩展**
+
+装饰后的函数自动添加两个关键字参数：
+- `backend=None`: 指定要使用的后端名称
+- `**backend_kwargs`: 传递给后端的额外参数
+
+```python
+# 用户可以显式指定后端
+result = nx.shortest_path(G, source, target, weight='weight', backend='cugraph')
+```
+
+**2. 算法注册**
+
+装饰器将函数注册到全局注册表 `_registered_algorithms`：
+
+```python
+# backends.py 内部实现
+_registered_algorithms = {}
+
+# 装饰器 __new__ 方法中的关键代码
+if name in _registered_algorithms:
+    raise KeyError(f"Algorithm already exists: {name}")
+_registered_algorithms[name] = self
+```
+
+**3. 后端发现**
+
+通过 Python 的 `entry_points` 机制自动发现已安装的后端：
+
+```python
+# backends.py
+backends = _get_backends("networkx.backends")
+```
+
+第三方后端需要在 `setup.cfg` 或 `pyproject.toml` 中声明：
+
+```toml
+[project.entry-points."networkx.backends"]
+cugraph = "nx_cugraph.dispatcher:Dispatcher"
+
+[project.entry-points."networkx.backend_info"]
+cugraph = "nx_cugraph.dispatcher:backend_info"
+```
+
+#### 5.5.4 分发流程详解
+
+**调用时的分发决策流程**：
+
+```
+用户调用 nx.shortest_path(G, source, target, ...)
+              │
+              ▼
+    @_dispatchable 装饰器拦截调用
+              │
+              ├──► 检查是否有后端安装？
+              │       │
+              │       ├── 否 ──► 直接调用原始 NetworkX 实现
+              │       │
+              │       └── 是 ──► 继续分发流程
+              │
+              ▼
+    检查用户是否显式指定 backend= 参数？
+              │
+              ├── 是 ──► 尝试使用指定后端
+              │              │
+              │              ├── 后端实现了该函数？
+              │              │       │
+              │              │       ├── 是 ──► 转换图参数（如果需要）
+              │              │       │              │
+              │              │       │              ▼
+              │              │       │       调用后端实现
+              │              │       │
+              │              │       └── 否 ──► 抛出 NotImplementedError
+              │              │
+              │              └── 图需要转换？
+              │                      │
+              │                      ├── 是 ──► 使用 convert_from_nx 转换
+              │                      │
+              │                      └── 否 ──► 直接传递原始图
+              │
+              └── 否 ──► 自动选择后端
+                             │
+                             ├── 输入图来自某个后端？
+                             │       │
+                             │       └── 是 ──► 优先使用该后端
+                             │
+                             └── 检查 nx.config.backend_priority
+                                     │
+                                     └── 按优先级尝试后端
+```
+
+**关键代码路径**（`_call_if_any_backends_installed`）：
+
+```python
+# backends.py:554-1045
+def _call_if_any_backends_installed(self, /, *args, backend=None, **kwargs):
+    """Returns the result of the original function, or the backend function if
+    the backend is specified and that backend implements `func`."""
+    
+    # 1. 解析图参数
+    graphs_resolved = {...}  # 提取图参数
+    
+    # 2. 检测输入图的后端
+    graph_backend_names = {
+        getattr(g, "__networkx_backend__", None)
+        for g in graphs_resolved.values()
+    }
+    
+    # 3. 确定后端优先级
+    backend_priority = nx.config.backend_priority.get(...)
+    
+    # 4. 按优先级尝试后端
+    for backend_name in try_order:
+        if self._can_backend_run(backend_name, args, kwargs):
+            if self._should_backend_run(backend_name, args, kwargs):
+                return self._convert_and_call(backend_name, ...)
+```
+
+#### 5.5.5 第三方后端如何替换默认实现
+
+**后端需要实现的接口**：
+
+1. **必需属性**：
+   - `can_run(func_name, args, kwargs)`: 检查是否可以运行该函数
+   - `should_run(func_name, args, kwargs)`: 检查是否应该运行该函数
+
+2. **可选但推荐实现**：
+   - `convert_from_nx(G, ...)`: 将 NetworkX 图转换为后端图
+   - `convert_to_nx(G)`: 将后端图转换回 NetworkX 图
+
+3. **算法实现**：
+   - 实现与分发名称相同的函数
+
+**示例：一个简化的后端实现**：
+
+```python
+# 第三方后端的 dispatcher.py
+
+class MyBackendDispatcher:
+    """示例后端分发器"""
+    
+    @staticmethod
+    def can_run(func_name, args, kwargs):
+        """检查是否可以运行该函数"""
+        # 例如：只支持某些图类型或参数组合
+        return True  # 或返回原因字符串
+        
+    @staticmethod
+    def should_run(func_name, args, kwargs):
+        """检查是否应该运行该函数（性能考虑）"""
+        # 例如：只在图足够大时才使用后端
+        G = args[0]
+        return G.number_of_nodes() > 1000
+        
+    @staticmethod
+    def convert_from_nx(G, edge_attrs=None, node_attrs=None, ...):
+        """将 NetworkX 图转换为后端图"""
+        # 实现图转换逻辑
+        return MyBackendGraph(G)
+        
+    @staticmethod
+    def convert_to_nx(G):
+        """将后端图转换回 NetworkX 图"""
+        return nx.Graph(G)
+    
+    # 算法实现
+    @staticmethod
+    def shortest_path(G, source=None, target=None, weight=None, method="dijkstra"):
+        """后端实现的最短路径算法"""
+        # 使用后端的高性能实现
+        return my_backend_shortest_path(G, source, target, weight)
+    
+    @staticmethod
+    def dijkstra_path(G, source, target, weight="weight"):
+        """后端实现的 Dijkstra 算法"""
+        # ...
+        pass
+```
+
+**后端信息声明**：
+
+```python
+def backend_info():
+    """返回后端元数据"""
+    return {
+        "functions": {
+            "shortest_path": None,
+            "dijkstra_path": None,
+            "floyd_warshall": None,
+            # ... 其他实现的函数
+        },
+        "default_config": {
+            # 后端特定的默认配置
+        }
+    }
+```
+
+#### 5.5.6 图转换机制
+
+当后端需要不同的图数据结构时，`_dispatchable` 机制会自动进行图转换：
+
+```python
+# backends.py:1148-1290
+def _convert_arguments(self, backend_name, args, kwargs, *, use_cache, mutations):
+    """Convert graph arguments to the specified backend."""
+    
+    # 1. 绑定函数签名
+    bound = self.__signature__.bind(*args, **kwargs)
+    bound.apply_defaults()
+    
+    # 2. 确定要保留的属性
+    if preserve_edge_attrs = self.preserve_edge_attrs
+    preserve_node_attrs = self.preserve_node_attrs
+    
+    # 3. 解析边/节点属性
+    edge_attrs = self.edge_attrs
+    node_attrs = self.node_attrs
+    
+    # 4. 调用后端的 convert_from_nx
+    # ...
+```
+
+**转换缓存机制**：
+
+```python
+# 配置项：NETWORKX_CACHE_CONVERTED_GRAPHS
+# 默认启用缓存，避免重复转换
+```
+
+#### 5.5.7 配置与环境变量
+
+用户可以通过环境变量或 `nx.config` 控制后端行为：
+
+| 环境变量 | 作用 |
+|---------|------|
+| `NETWORKX_BACKEND_PRIORITY` | 后端优先级列表，逗号分隔 |
+| `NETWORKX_AUTOMATIC_BACKENDS` | （弃用）自动后端 |
+| `NETWORKX_CACHE_CONVERTED_GRAPHS` | 是否缓存转换后的图 |
+| `NETWORKX_FALLBACK_TO_NX` | 后端失败时是否回退到 NetworkX |
+| `NETWORKX_WARNINGS_TO_IGNORE` | 要忽略的警告类型 |
+
+**运行时配置示例**：
+
+```python
+import networkx as nx
+
+# 设置后端优先级
+nx.config.backend_priority.algos = ["cugraph", "nx"]
+
+# 或仅对特定函数设置
+nx.config.backend_priority["shortest_path"] = ["cugraph"]
+
+# 禁用自动回退
+nx.config.fallback_to_nx = True
+```
+
+#### 5.5.8 架构位置与设计价值
+
+**在最短路径算法族中的架构位置**：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      用户 API 层                            │
+│  shortest_path(), dijkstra_path(), floyd_warshall(), ...   │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+┌─────────────────────────▼───────────────────────────────────┐
+│              @_dispatchable 装饰器层                     │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │ 1. 函数签名扩展 (backend=, backend_kwargs=)  │   │
+│  │ 2. 后端发现与注册                               │   │
+│  │ 3. 图参数解析与属性处理                       │   │
+│  │ 4. 分发决策逻辑                                │   │
+│  │ 5. 图转换与缓存                                │   │
+│  │ 6. 后端调用与回退                           │   │
+│  └─────────────────────────────────────────────────┘   │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+            ┌─────────────┴─────────────┐
+            │                         │
+┌───────────▼───────────┐  ┌────────▼────────┐
+│   NetworkX 默认实现    │  │  第三方后端实现  │
+│  (纯 Python, 通用性)  │  │ (高性能, 特定)  │
+└───────────────────────┘  └─────────────────┘
+```
+
+**设计价值**：
+
+1. **透明性**：用户代码无需修改即可享受后端加速
+2. **可扩展性**：易于添加新的后端实现
+3. **灵活性**：支持图转换、缓存、优先级配置
+4. **健壮性**：支持回退到默认实现
+5. **可观测性**：通过日志记录后端选择和转换过程
+
+#### 5.5.9 最短路径模块的装饰器使用模式
+
+最短路径模块中 `@_dispatchable` 的使用模式：
+
+| 模块 | 装饰器模式 | 原因 |
+|------|-----------|------|
+| `generic.py` | `@_dispatchable` 或 `@_dispatchable(edge_attrs="weight")` | 统一接口层，需要传递 weight 参数 |
+| `unweighted.py` | `@_dispatchable` | 无权图算法，无 weight 参数 |
+| `weighted.py` | `@_dispatchable(edge_attrs="weight")` | 带权图算法，需要转换 weight 属性 |
+| `dense.py` | `@_dispatchable(edge_attrs="weight")` | 稠密图算法，需要转换 weight 属性 |
+| `astar.py` | `@_dispatchable(edge_attrs="weight", preserve_node_attrs="heuristic")` | 需要保留 heuristic 节点属性 |
+
+**特别注意 `preserve_node_attrs` 的作用**：
+
+```python
+# astar.py
+@nx._dispatchable(edge_attrs="weight", preserve_node_attrs="heuristic")
+def astar_path(G, source, target, heuristic=None, weight="weight"): ...
+```
+
+- `heuristic` 参数是一个函数，不是图属性
+- `preserve_node_attrs="heuristic"` 表示该参数可能影响属性处理
+- 当 `heuristic=True` 或 `heuristic` 是可调用对象时，需要保留所有节点属性
+
 ---
 
 ## 附录：关键函数索引
@@ -1691,7 +2065,7 @@ def _bellman_ford(
               │                           │
               ▼              ┌────────────┴────────────┐
        V 次 BFS              │                         │
-    O(V(V+E))              有负权?                 无非负权
+    O(V(V+E))              有负权?                  非负权
                             │                         │
                     ┌───────┴───────┐                 │
                     │               │                 │
