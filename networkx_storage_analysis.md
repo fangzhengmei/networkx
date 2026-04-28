@@ -317,7 +317,223 @@ G._pred = {
 assert G._succ[1][2] is G._pred[2][1]  # True
 ```
 
-### 2.6 四种图类型存储结构对比
+### 2.6 多重继承与方法解析顺序（MRO）
+
+`MultiDiGraph` 是 NetworkX 中最复杂的图类型，它同时继承了 `MultiGraph` 和 `DiGraph`，这种多重继承设计需要仔细处理方法解析顺序（MRO）。
+
+#### 2.6.1 继承层次与 MRO
+
+**类定义**（`multidigraph.py:22`）：
+```python
+class MultiDiGraph(MultiGraph, DiGraph):
+```
+
+**继承层次**：
+```
+object
+  │
+  └── Graph
+        │
+        ├── DiGraph
+        │
+        └── MultiGraph
+              │
+              └── MultiDiGraph (同时继承 DiGraph 和 MultiGraph)
+```
+
+**Python MRO（C3 线性化）**：
+```python
+import networkx as nx
+print([c.__name__ for c in nx.MultiDiGraph.__mro__])
+# 输出: ['MultiDiGraph', 'MultiGraph', 'DiGraph', 'Graph', 'object']
+```
+
+注意：`MultiDiGraph` 列在第一位，然后是 `MultiGraph`，然后是 `DiGraph`，然后是 `Graph`。这意味着方法查找时优先检查 `MultiDiGraph` 自己，然后是 `MultiGraph`，再是 `DiGraph`。
+
+#### 2.6.2 关键操作的方法解析
+
+##### 1. `__init__` 方法
+
+`MultiDiGraph.__init__` **显式调用** `DiGraph.__init__`，而不是通过 `super()` 使用 MRO（`multidigraph.py:360-373`）：
+
+```python
+def __init__(self, incoming_graph_data=None, multigraph_input=None, **attr):
+    # ... 参数处理 ...
+    else:
+        DiGraph.__init__(self, incoming_graph_data, **attr)  # 显式调用
+```
+
+**设计意图**：
+- `DiGraph.__init__` 初始化 `_succ` 和 `_pred` 两个字典（这是有向图的核心存储结构）
+- 而 `Graph.__init__` 只初始化一个 `_adj` 字典
+- 显式调用确保了正确的存储结构被初始化
+
+##### 2. `add_edge` 方法
+
+四种图类型都有**独立实现**的 `add_edge` 方法，因为它们的存储结构不同：
+
+| 图类型 | add_edge 位置 | 存储操作 |
+|--------|--------------|----------|
+| `Graph` | `graph.py:968-994` | `self._adj[u][v] = self._adj[v][u] = datadict` |
+| `DiGraph` | `digraph.py:730-756` | `self._succ[u][v] = self._pred[v][u] = datadict` |
+| `MultiGraph` | `multigraph.py:442-536` | `self._adj[u][v] = self._adj[v][u] = keydict`（边键层） |
+| `MultiDiGraph` | `multidigraph.py:427-523` | `self._succ[u][v] = self._pred[v][u] = keydict`（边键层） |
+
+**`MultiDiGraph.add_edge` 的实现细节**（`multidigraph.py:507-521`）：
+
+```python
+if key is None:
+    key = self.new_edge_key(u, v)  # 调用 MultiGraph.new_edge_key
+if v in self._succ[u]:
+    keydict = self._adj[u][v]
+    datadict = keydict.get(key, self.edge_attr_dict_factory())
+    datadict.update(attr)
+    keydict[key] = datadict
+else:
+    datadict = self.edge_attr_dict_factory()
+    datadict.update(attr)
+    keydict = self.edge_key_dict_factory()
+    keydict[key] = datadict
+    self._succ[u][v] = keydict
+    self._pred[v][u] = keydict  # 边键字典共享引用
+```
+
+**关键设计点**：
+1. 调用 `self.new_edge_key(u, v)` 生成边键——这个方法继承自 `MultiGraph`
+2. 边键字典（`keydict`）在 `_succ[u][v]` 和 `_pred[v][u]` 间共享引用
+3. 每条边有独立的属性字典（`datadict`）
+
+##### 3. `degree` 属性
+
+`MultiDiGraph` 用 `@cached_property` 自己定义了 `degree` 属性（`multidigraph.py:722-768`）：
+
+```python
+@cached_property
+def degree(self):
+    return DiMultiDegreeView(self)
+```
+
+**不同 DegreeView 的度计算逻辑**：
+
+| 视图类 | 适用图类型 | `__getitem__` 计算方式 |
+|--------|-----------|------------------------|
+| `DiDegreeView` | DiGraph | `len(succs) + len(preds)` |
+| `DegreeView` | Graph | `len(nbrs) + (n in nbrs)`（自环修正） |
+| `MultiDegreeView` | MultiGraph | `sum(len(keys) for keys in nbrs.values()) + (n in nbrs and len(nbrs[n]))` |
+| `DiMultiDegreeView` | MultiDiGraph | `sum(len(keys) for keys in succs.values()) + sum(len(keys) for keys in preds.values())` |
+
+**`DiMultiDegreeView` 的实现**（`reportviews.py:739-781`）：
+
+```python
+class DiMultiDegreeView(DiDegreeView):
+    def __getitem__(self, n):
+        weight = self._weight
+        succs = self._succ[n]
+        preds = self._pred[n]
+        if weight is None:
+            # 统计出边键数 + 入边键数
+            return sum(len(keys) for keys in succs.values()) + sum(
+                len(keys) for keys in preds.values()
+            )
+        # 加权度：遍历所有边键的属性字典
+        deg = sum(
+            d.get(weight, 1) for key_dict in succs.values() for d in key_dict.values()
+        ) + sum(
+            d.get(weight, 1) for key_dict in preds.values() for d in key_dict.values()
+        )
+        return deg
+```
+
+#### 2.6.3 对四层嵌套字典存储的影响
+
+多重继承设计对 `MultiDiGraph` 的存储结构有以下具体影响：
+
+##### 1. 存储结构初始化
+
+由于显式调用 `DiGraph.__init__`，`MultiDiGraph` 初始化了**两个独立的四层嵌套字典**：
+
+```python
+# DiGraph.__init__ 中初始化
+self._succ = self.adjlist_outer_dict_factory()  # 四层结构
+self._pred = self.adjlist_outer_dict_factory()  # 四层结构
+self._adj = self._succ  # _adj 是 _succ 的别名
+```
+
+而如果继承 `Graph`，只会初始化一个 `_adj` 字典。
+
+##### 2. 边键字典的共享引用
+
+`MultiDiGraph.add_edge` 中的共享引用机制：
+
+```python
+# 添加新边时
+keydict = self.edge_key_dict_factory()  # 边键字典
+keydict[key] = datadict                  # 边键 → 属性字典
+self._succ[u][v] = keydict               # 存储到出边表
+self._pred[v][u] = keydict               # 存储到入边表（同一引用）
+```
+
+**验证共享引用**：
+```python
+G = nx.MultiDiGraph()
+key1 = G.add_edge(1, 2, weight=3.0)  # 1->2, key=0
+key2 = G.add_edge(1, 2, weight=5.0)  # 1->2, key=1
+
+# 边键字典共享
+assert G._succ[1][2] is G._pred[2][1]  # True
+
+# 每条边有独立的属性字典
+assert G._succ[1][2][0] is not G._succ[1][2][1]  # True
+
+# 通过 _succ 修改，通过 _pred 也能看到
+G._succ[1][2][0]['weight'] = 10.0
+print(G._pred[2][1][0]['weight'])  # 10.0
+```
+
+##### 3. 与 `MultiGraph` 的对比
+
+| 特性 | MultiGraph | MultiDiGraph |
+|------|-----------|--------------|
+| 邻接字典 | 单个 `_adj` | `_succ` + `_pred` |
+| 边键字典共享 | `_adj[u][v] is _adj[v][u]` | `_succ[u][v] is _pred[v][u]` |
+| 方向 | 无向 | 有向 |
+| 反向边 | 不适用（同一存储） | `_succ[v][u]` 是独立的 |
+
+**反向边的独立性**：
+```python
+G = nx.MultiDiGraph()
+G.add_edge(1, 2, weight=3.0)  # 1->2
+G.add_edge(2, 1, weight=5.0)  # 2->1
+
+# 这是两条完全独立的边
+assert G._succ[1][2] is not G._succ[2][1]  # True
+assert G._succ[1][2] is not G._pred[1][2]   # True（_pred[1][2] 是 2->1 的边键字典）
+```
+
+#### 2.6.4 方法重写与 MRO 的交互
+
+`MultiDiGraph` 重写了大部分关键方法，避免了 MRO 带来的歧义：
+
+| 方法 | 是否重写 | 调用来源 |
+|------|----------|----------|
+| `__init__` | 是 | 显式调用 `DiGraph.__init__` |
+| `add_edge` | 是 | 自己的实现 |
+| `remove_edge` | 是 | 自己的实现 |
+| `adj/succ/pred` | 是 | `@cached_property` 返回 `MultiAdjacencyView` |
+| `edges/out_edges` | 是 | `@cached_property` 返回 `OutMultiEdgeView` |
+| `in_edges` | 是 | `@cached_property` 返回 `InMultiEdgeView` |
+| `degree` | 是 | `@cached_property` 返回 `DiMultiDegreeView` |
+| `new_edge_key` | 否 | 继承自 `MultiGraph` |
+| `is_multigraph` | 是 | 返回 `True` |
+| `is_directed` | 是 | 返回 `True` |
+
+**设计原则**：
+1. **核心修改操作**（`add_edge`, `remove_edge`）完全重写，因为存储结构不同
+2. **视图属性**（`adj`, `edges`, `degree`）重写，返回适合多重有向图的视图类
+3. **辅助方法**（`new_edge_key`）从 `MultiGraph` 继承，因为逻辑相同
+4. **类型检查方法**（`is_multigraph`, `is_directed`）重写，返回正确的类型标识
+
+### 2.7 四种图类型存储结构对比
 
 | 特性 | Graph | DiGraph | MultiGraph | MultiDiGraph |
 |------|-------|---------|------------|--------------|
