@@ -409,6 +409,233 @@ $$M = \alpha A + (1 - \alpha) \mathbf{1} p^T$$
 
 ---
 
+## 3.5 特征向量中心性与 Katz 中心性的多版本实现
+
+与 PageRank 类似，特征向量中心性和 Katz 中心性也提供了两套实现：幂迭代版本和 NumPy 直接求解版本。
+
+### 3.5.1 特征向量中心性的两套实现对比
+
+| 特性 | 幂迭代版 `eigenvector_centrality` | NumPy 版 `eigenvector_centrality_numpy` |
+|------|-----------------------------------|----------------------------------------|
+| 底层技术 | 纯 Python 幂迭代 | SciPy ARPACK (`sp.sparse.linalg.eigs`) |
+| 图连通性要求 | 无（但非强连通图可能收敛慢） | **必须连通**（有向图强连通，无向图连通） |
+| 默认迭代次数 | `max_iter=100` | `max_iter=50`（Arnoldi 迭代） |
+| 收敛阈值 | `tol=1e-6` | `tol=0`（机器精度） |
+| 异常类型 | `PowerIterationFailedConvergence` | `ArpackNoConvergence`, `AmbiguousSolution` |
+
+#### 实现差异分析
+
+**幂迭代版核心实现** (eigenvector.py:162-194)：
+```python
+def eigenvector_centrality(G, max_iter=100, tol=1.0e-6, nstart=None, weight=None):
+    # 初始化：默认全 1 向量
+    if nstart is None:
+        nstart = {v: 1 for v in G}
+    x = {k: v / nstart_sum for k, v in nstart.items()}
+    
+    # 幂迭代：使用 (A + I) 而非 A 以保证收敛
+    for _ in range(max_iter):
+        xlast = x
+        x = xlast.copy()  # I * xlast
+        # 累加 A * xlast
+        for n in x:
+            for nbr in G[n]:
+                w = G[n][nbr].get(weight, 1) if weight else 1
+                x[nbr] += xlast[n] * w
+        
+        # 归一化为单位欧氏范数
+        norm = math.hypot(*x.values()) or 1
+        x = {k: v / norm for k, v in x.items()}
+        
+        # L1 范数收敛检查
+        if sum(abs(x[n] - xlast[n]) for n in x) < nnodes * tol:
+            return x
+    raise nx.PowerIterationFailedConvergence(max_iter)
+```
+
+**NumPy 版核心实现** (eigenvector.py:339-357)：
+```python
+def eigenvector_centrality_numpy(G, weight=None, max_iter=50, tol=0):
+    # 前置检查：图必须连通
+    connected = nx.is_strongly_connected(G) if G.is_directed() else nx.is_connected(G)
+    if not connected:
+        raise nx.AmbiguousSolution(
+            "`eigenvector_centrality_numpy` does not give consistent results for disconnected graphs"
+        )
+    
+    # 构建稀疏邻接矩阵
+    M = nx.to_scipy_sparse_array(G, nodelist=list(G), weight=weight, dtype=float)
+    
+    # 使用 ARPACK 求解最大实特征值对应的特征向量
+    # which="LR" 表示 Largest Real part
+    _, eigenvector = sp.sparse.linalg.eigs(
+        M.T, k=1, which="LR", maxiter=max_iter, tol=tol
+    )
+    
+    # 处理结果：取实部并归一化
+    largest = eigenvector.flatten().real
+    norm = np.sign(largest.sum()) * sp.linalg.norm(largest)
+    return dict(zip(G, (largest / norm).tolist()))
+```
+
+#### 关键设计差异
+
+1. **矩阵选择**：
+   - 幂迭代版：使用 $(A + I)$ 进行迭代，避免负主导特征值问题
+   - NumPy 版：直接使用 $A^T$，通过 `which="LR"` 指定寻找最大实特征值
+
+2. **连通性要求**：
+   - 幂迭代版：无强制要求，但非连通图可能收敛到各分量的混合
+   - NumPy 版：**强制要求连通**，否则抛出 `AmbiguousSolution`
+   - 原因：ARPACK 在非连通图上可能选择不同的特征向量，结果不一致
+
+3. **异常处理**：
+   - 幂迭代版：超时时抛出 `PowerIterationFailedConvergence`
+   - NumPy 版：ARPACK 不收敛时抛出 `ArpackNoConvergence`，图不连通时抛出 `AmbiguousSolution`
+
+#### 适用场景
+
+| 场景 | 推荐版本 | 原因 |
+|------|----------|------|
+| 大规模稀疏图 | 幂迭代版 | 内存效率高，无需构建完整矩阵 |
+| 小规模连通图 | NumPy 版 | 直接求解，无收敛问题 |
+| 非连通图 | 幂迭代版 | NumPy 版会拒绝计算 |
+| 需要精确控制收敛 | 幂迭代版 | 可调整 `tol` 和 `max_iter` |
+| 快速验证 | NumPy 版 | 直接求解，无需担心迭代次数 |
+
+---
+
+### 3.5.2 Katz 中心性的两套实现对比
+
+| 特性 | 幂迭代版 `katz_centrality` | NumPy 版 `katz_centrality_numpy` |
+|------|----------------------------|---------------------------------|
+| 底层技术 | 纯 Python 幂迭代 | NumPy 线性求解 (`np.linalg.solve`) |
+| α 条件 | 迭代中检查收敛 | **必须满足** $\alpha < 1/\lambda_{\max}$ |
+| 稠密矩阵 | 不需要 | **需要**（构建完整稠密矩阵） |
+| 异常类型 | `PowerIterationFailedConvergence` | `LinAlgError`（矩阵奇异时） |
+
+#### 实现差异分析
+
+**幂迭代版核心实现** (katz.py:149-194)：
+```python
+def katz_centrality(G, alpha=0.1, beta=1.0, max_iter=1000, tol=1.0e-6, ...):
+    # 初始化：默认全 0 向量
+    if nstart is None:
+        x = {n: 0 for n in G}
+    
+    # 构建 beta 向量
+    try:
+        b = dict.fromkeys(G, float(beta))
+    except (TypeError, ValueError, AttributeError):
+        b = beta  # beta 可能是字典
+    
+    # 幂迭代：x = alpha * A^T * x + beta
+    for _ in range(max_iter):
+        xlast = x
+        x = dict.fromkeys(xlast, 0)
+        
+        # 计算 A^T * xlast
+        for n in x:
+            for nbr in G[n]:
+                x[nbr] += xlast[n] * G[n][nbr].get(weight, 1)
+        
+        # x = alpha * (A^T * xlast) + beta
+        for n in x:
+            x[n] = alpha * x[n] + b[n]
+        
+        # 收敛检查
+        error = sum(abs(x[n] - xlast[n]) for n in x)
+        if error < nnodes * tol:
+            # 可选归一化
+            if normalized:
+                s = 1.0 / math.hypot(*x.values())
+            else:
+                s = 1
+            for n in x:
+                x[n] *= s
+            return x
+    raise nx.PowerIterationFailedConvergence(max_iter)
+```
+
+**NumPy 版核心实现** (katz.py:309-331)：
+```python
+def katz_centrality_numpy(G, alpha=0.1, beta=1.0, normalized=True, weight=None):
+    # 构建 beta 向量
+    try:
+        nodelist = beta.keys()
+        b = np.array(list(beta.values()), dtype=float)
+    except AttributeError:
+        nodelist = list(G)
+        b = np.ones((len(nodelist), 1)) * beta
+    
+    # 构建邻接矩阵的转置（稠密矩阵）
+    A = nx.adjacency_matrix(G, nodelist=nodelist, weight=weight).todense().T
+    
+    # 直接求解线性方程组：(I - alpha * A^T) * x = beta
+    n = A.shape[0]
+    centrality = np.linalg.solve(np.eye(n, n) - (alpha * A), b).squeeze()
+    
+    # 可选归一化
+    norm = np.sign(np.sum(centrality)) * np.linalg.norm(centrality) if normalized else 1
+    return dict(zip(nodelist, (centrality / norm).tolist()))
+```
+
+#### 关键设计差异
+
+1. **数学方法**：
+   - 幂迭代版：通过迭代求解不动点方程 $x = \alpha A^T x + \beta$
+   - NumPy 版：直接求解线性方程组 $(I - \alpha A^T) x = \beta$
+
+2. **α 参数约束**：
+   - 幂迭代版：只要收敛即可，不强制检查 $\alpha < 1/\lambda_{\max}$
+   - NumPy 版：**要求矩阵 $(I - \alpha A^T)$ 可逆**，即 $\alpha < 1/\lambda_{\max}$
+   - 如果 $\alpha$ 过大，NumPy 版会抛出 `LinAlgError`（矩阵奇异）
+
+3. **内存需求**：
+   - 幂迭代版：$O(n)$，只需存储当前迭代向量
+   - NumPy 版：$O(n^2)$，需要构建完整稠密邻接矩阵
+
+4. **归一化时机**：
+   - 幂迭代版：收敛后才进行归一化
+   - NumPy 版：求解后进行归一化
+
+#### 适用场景
+
+| 场景 | 推荐版本 | 原因 |
+|------|----------|------|
+| 大规模图 ($n > 10^4$) | 幂迭代版 | 无需稠密矩阵，内存可控 |
+| 小规模图 ($n < 10^3$) | NumPy 版 | 直接求解，精度高 |
+| α 接近 $1/\lambda_{\max}$ | 幂迭代版 | NumPy 版可能因矩阵接近奇异而失败 |
+| 需要 β 为字典（节点个性化） | 两者均可 | 两个版本都支持 β 为字典 |
+| 需要非归一化结果 | 两者均可 | 通过 `normalized=False` 控制 |
+
+---
+
+### 3.5.3 多版本策略的设计哲学
+
+与 PageRank 类似，特征向量中心性和 Katz 中心性的多版本策略体现了以下设计考量：
+
+1. **性能与精度的权衡**：
+   - 幂迭代版：牺牲一定精度（需收敛）换取内存效率和可扩展性
+   - NumPy 版：牺牲内存换取精确性和速度（小规模图）
+
+2. **用户群体分层**：
+   - 普通用户：使用默认幂迭代版，无需理解特征值求解细节
+   - 高级用户：可选择 NumPy 版获得更精确的结果
+
+3. **与 PageRank 的差异**：
+   - PageRank：默认使用 SciPy 稀疏矩阵版（性能最优）
+   - 特征向量/Katz：默认使用纯 Python 幂迭代版（兼容性更好）
+   - 原因：PageRank 常用于大规模 Web 图，性能更关键；特征向量/Katz 更多用于学术研究，兼容性更重要
+
+4. **无自动降级机制**：
+   - 与 PageRank 相同，特征向量中心性和 Katz 中心性的两套实现也是**独立的可调用工具**
+   - `eigenvector_centrality` 和 `eigenvector_centrality_numpy` 是两个独立的公开函数
+   - 不存在一个入口函数自动选择版本的机制
+   - 用户需根据需求显式选择调用哪个版本
+
+---
+
 ## 4. `normalize` 参数的语义差异总结
 
 ### 4.1 各算法归一化方式对比
@@ -594,6 +821,77 @@ if sum(abs(x[n] - xlast[n]) for n in x) < nnodes * tol:
 3. **起始向量**：
    - 好的起始向量（如 `nstart`）可减少迭代次数
    - PageRank 默认使用均匀分布
+
+#### 收敛失败边界场景
+
+当幂迭代达到 `max_iter` 次仍未满足收敛条件时，所有幂迭代版本都会抛出 `PowerIterationFailedConvergence` 异常。
+
+**各算法抛出位置与条件**：
+
+| 算法 | 抛出位置 | 默认 `max_iter` | 收敛检查方式 |
+|------|----------|-----------------|--------------|
+| 特征向量中心性（幂迭代） | `eigenvector.py:194` | 100 | L1 范数 `< nnodes * tol` |
+| Katz 中心性（幂迭代） | `katz.py:194` | 1000 | L1 范数 `< nnodes * tol` |
+| PageRank（纯 Python） | `pagerank_alg.py:172` | 100 | L1 范数 `< N * tol` |
+| PageRank（SciPy） | `pagerank_alg.py:501` | 100 | L1 范数 `< N * tol` |
+
+**触发收敛失败的常见原因**：
+
+1. **谱间隙过小**：
+   - 当次大特征值 $|\lambda_2|$ 非常接近主特征值 $\lambda_1$ 时
+   - 收敛速度呈几何级数下降：$O\left(\left|\frac{\lambda_2}{\lambda_1}\right|^t\right)$
+   - PageRank 中 $\alpha$ 接近 1 时会出现此问题（$\alpha = 0.99$ 可能导致收敛极慢）
+
+2. **起始向量投影不佳**：
+   - 如果 `nstart` 提供的起始向量在主特征向量上的投影很小
+   - 幂迭代需要更多次迭代才能"捕捉"到主特征向量
+   - 特征向量中心性使用 $(A + I)$ 而非 $A$ 进行迭代，部分缓解了此问题
+
+3. **图结构问题**：
+   - 非强连通的有向图可能存在多个主特征向量
+   - 幂迭代可能在多个特征向量之间"震荡"
+   - 多个连通分量的无向图可能收敛到各分量的混合
+
+4. **数值精度问题**：
+   - 浮点数累积误差可能导致收敛检测失效
+   - 特别在图规模很大时，`nnodes * tol` 的阈值可能不够精确
+
+5. **Katz 中心性的 α 参数问题**：
+   - 如果 $\alpha \geq 1/\lambda_{\max}$，理论上不收敛
+   - 幂迭代可能发散或震荡
+
+**调用方应如何处理**：
+
+1. **捕获异常并调整参数**：
+   ```python
+   try:
+       centrality = nx.eigenvector_centrality(G, max_iter=100, tol=1e-6)
+   except nx.PowerIterationFailedConvergence:
+       # 增加迭代次数或放宽收敛阈值
+       centrality = nx.eigenvector_centrality(G, max_iter=500, tol=1e-4)
+   ```
+
+2. **使用 numpy 版本作为备选**：
+   - `eigenvector_centrality_numpy` 使用 ARPACK 直接求解，不依赖幂迭代
+   - `katz_centrality_numpy` 使用线性方程组直接求解
+   - **注意**：这些版本有自身的限制：
+     - `eigenvector_centrality_numpy` 要求图连通，否则抛出 `AmbiguousSolution`
+     - `katz_centrality_numpy` 要求 $\alpha < 1/\lambda_{\max}$，否则可能抛出 `LinAlgError`
+
+3. **调整算法参数**：
+   - **PageRank**：减小 $\alpha$（如从 0.85 改为 0.8）可增大谱间隙，加快收敛
+   - **Katz 中心性**：确保 $\alpha < 1/\lambda_{\max}$，可使用 `max(nx.adjacency_spectrum(G))` 计算最大特征值
+   - **所有算法**：增大 `max_iter` 或放宽 `tol`
+
+4. **预处理图结构**：
+   - 对非强连通图，考虑分析其强连通分量
+   - 或使用其他中心性度量（如 PageRank 天然处理非强连通图，因为有随机跳转）
+
+5. **切换到其他中心性度量**：
+   - 如果幂迭代持续失败，考虑使用更稳定的算法：
+     - 介数中心性（无收敛问题，但计算复杂度高）
+     - 接近度中心性（无收敛问题）
+     - 度中心性（最简单，无收敛问题）
 
 ### 5.4 大规模图的实际建议
 
