@@ -686,6 +686,281 @@ class UnionAtlas(Mapping):
 - 不复制数据，仅在访问时合并视图
 - 用于有向图的无向视图（如 `degree` 计算需要同时考虑入边和出边）
 
+#### 3.2.5 有向图的无向视图合并机制
+
+当有向图需要以无向方式访问时，NetworkX 使用 `Union*` 系列视图来动态合并 `_succ` 和 `_pred` 两个邻接表。
+
+##### 1. 触发条件
+
+**主要触发场景**（`graphviews.py:125-129`）：
+
+```python
+def generic_graph_view(G, create_using=None):
+    # ...
+    if newG.is_directed():
+        # 有向视图，直接使用 _succ 和 _pred
+    elif G.is_directed():
+        # 原图是有向图，但新视图要求无向
+        if G.is_multigraph():
+            newG._adj = UnionMultiAdjacency(G._succ, G._pred)  # 多重图
+        else:
+            newG._adj = UnionAdjacency(G._succ, G._pred)      # 非多重图
+```
+
+**触发方式**：
+
+| API 调用 | 触发条件 |
+|----------|----------|
+| `G.to_undirected(as_view=True)` | 明确要求创建无向视图 |
+| `generic_graph_view(G, nx.Graph)` | 指定 `create_using` 为无向图类型 |
+| `subgraph_view` 内部处理 | 某些子图操作可能触发 |
+
+**示例**：
+```python
+DG = nx.DiGraph()
+DG.add_edge(1, 2, weight=3.0)  # 1->2
+DG.add_edge(2, 3, weight=5.0)  # 2->3
+DG.add_edge(3, 1, weight=7.0)  # 3->1
+
+# 创建无向视图
+UG = DG.to_undirected(as_view=True)
+# UG._adj 是 UnionAdjacency(DG._succ, DG._pred)
+
+# 以无向方式访问
+print(list(UG.edges))  # [(1, 2), (2, 3), (3, 1)]
+print(UG.has_edge(1, 2))  # True
+print(UG.has_edge(2, 1))  # True（无向视图中是同一条边）
+```
+
+##### 2. 合并逻辑详解
+
+Union* 视图的核心是**惰性合并**——不复制数据，只在访问时动态计算并集。
+
+###### 2.1 UnionAdjacency（非多重图）
+
+**核心实现**（`coreviews.py:165-214`）：
+
+```python
+class UnionAdjacency(Mapping):
+    __slots__ = ("_succ", "_pred")
+    
+    def __init__(self, succ, pred):
+        # 断言：两个字典的键（节点）应该相同
+        assert len(set(succ.keys()) ^ set(pred.keys())) == 0
+        self._succ = succ
+        self._pred = pred
+    
+    def __len__(self):
+        return len(self._succ)  # 两个字典长度相同
+    
+    def __iter__(self):
+        return iter(self._succ)
+    
+    def __getitem__(self, nbr):
+        # 返回 UnionAtlas，合并该节点的出边和入边邻居
+        return UnionAtlas(self._succ[nbr], self._pred[nbr])
+```
+
+**设计要点**：
+- 外层节点迭代直接使用 `_succ` 的键（因为 `_succ` 和 `_pred` 的节点集相同）
+- 访问 `G.adj[u]` 时返回 `UnionAtlas(self._succ[u], self._pred[u])`
+
+###### 2.2 UnionAtlas（邻居层合并）
+
+**核心实现**（`coreviews.py:110-162`）：
+
+```python
+class UnionAtlas(Mapping):
+    __slots__ = ("_succ", "_pred")
+    
+    def __init__(self, succ, pred):
+        self._succ = succ  # 出边邻居：{neighbor: edge_attr_dict}
+        self._pred = pred  # 入边邻居：{neighbor: edge_attr_dict}
+    
+    def __len__(self):
+        # 并集的大小：出边邻居 + 入边邻居 - 重复的
+        return len(self._succ.keys() | self._pred.keys())
+    
+    def __iter__(self):
+        # 迭代并集
+        return iter(set(self._succ.keys()) | set(self._pred.keys()))
+    
+    def __getitem__(self, key):
+        # 优先从出边找，找不到从入边找
+        try:
+            return self._succ[key]
+        except KeyError:
+            return self._pred[key]
+```
+
+**合并逻辑示例**：
+
+```python
+DG = nx.DiGraph()
+DG.add_edge(1, 2, weight=3.0)  # 1->2
+DG.add_edge(3, 1, weight=5.0)  # 3->1
+DG.add_edge(1, 4, weight=7.0)  # 1->4
+DG.add_edge(2, 1, weight=9.0)  # 2->1
+
+# 对于节点 1：
+# _succ[1] = {2: {'weight': 3.0}, 4: {'weight': 7.0}}  出边
+# _pred[1] = {3: {'weight': 5.0}, 2: {'weight': 9.0}}  入边
+
+# UnionAtlas(_succ[1], _pred[1]) 的行为：
+# len() = len({2,4} | {3,2}) = 3  (邻居: 2, 3, 4)
+# __getitem__(2) = _succ[2]? 不，是 _succ[1][2] = {'weight': 3.0}
+# __getitem__(3) = _pred[1][3] = {'weight': 5.0}
+```
+
+**注意**：当同一对节点间存在双向边时，`__getitem__` 优先返回出边的属性字典。这是设计上的权衡。
+
+###### 2.3 多重图的 UnionMultiAdjacency 和 UnionMultiInner
+
+对于多重有向图，使用 `UnionMultiAdjacency` 和 `UnionMultiInner` 来处理四层嵌套字典。
+
+**UnionMultiInner**（`coreviews.py:217-246`）：
+
+```python
+class UnionMultiInner(UnionAtlas):
+    __slots__ = ()  # 复用 _succ, _pred
+    
+    def __getitem__(self, node):
+        in_succ = node in self._succ
+        in_pred = node in self._pred
+        if in_succ:
+            if in_pred:
+                # 双向都有，返回 UnionAtlas
+                return UnionAtlas(self._succ[node], self._pred[node])
+            return UnionAtlas(self._succ[node], {})
+        return UnionAtlas({}, self._pred[node])
+```
+
+**关键差异**：
+- 多重图中，`_succ[node] 是 `{neighbor: {edge_key: edge_attr}}`
+- 所以需要额外的 `UnionMultiInner` 来处理边键层的合并
+
+**访问层级对比**：
+
+| 图类型 | `G.adj[u] 返回 | `G.adj[u][v]` 返回 |
+|--------|------------------|---------------------|
+| DiGraph（无向视图） | `UnionAtlas` | 边属性字典 |
+| MultiDiGraph（无向视图） | `UnionMultiInner` | `UnionAtlas`（边键层） |
+
+##### 3. 实时更新保证
+
+Union* 视图通过以下机制保证实时更新：
+
+###### 3.1 仅保存引用，不复制数据
+
+```python
+class UnionAtlas(Mapping):
+    def __init__(self, succ, pred):
+        self._succ = succ  # 仅保存引用
+        self._pred = pred  # 仅保存引用
+```
+
+视图对象不存储任何数据的副本，只保存对底层 `_succ` 和 `_pred` 字典的引用。
+
+###### 3.2 每次访问实时计算
+
+```python
+def __len__(self):
+    # 每次访问都重新计算并集
+    return len(self._succ.keys() | self._pred.keys())
+
+def __iter__(self):
+    # 每次迭代都重新计算并集
+    return iter(set(self._succ.keys()) | set(self._pred.keys()))
+
+def __getitem__(self, key):
+    # 每次访问都从原始字典获取
+    try:
+        return self._succ[key]
+    except KeyError:
+        return self._pred[key]
+```
+
+**实时更新示例**：
+
+```python
+DG = nx.DiGraph()
+DG.add_edge(1, 2)
+DG.add_edge(2, 3)
+
+# 创建无向视图
+UG = DG.to_undirected(as_view=True)
+
+print(list(UG.edges))  # [(1, 2), (2, 3)]
+print(UG.degree(1))      # 1
+
+# 修改原图
+DG.add_edge(3, 1)  # 添加 3->1
+
+# 视图自动更新
+print(list(UG.edges))  # [(1, 2), (2, 3), (3, 1)]
+print(UG.degree(1))      # 2（1->2 和 3->1）
+```
+
+###### 3.3 与 DegreeView 的实时性
+
+`DiDegreeView` 在计算度时也是实时访问 `_succ` 和 `_pred`：
+
+```python
+class DiDegreeView:
+    def __getitem__(self, n):
+        succs = self._succ[n]  # 实时访问
+        preds = self._pred[n]  # 实时访问
+        if weight is None:
+            return len(succs) + len(preds)  # 实时计算
+```
+
+##### 4. 设计权衡与注意事项
+
+###### 4.1 双向边的属性访问
+
+当存在双向边时，`UnionAtlas.__getitem__` 优先返回出边的属性字典：
+
+```python
+DG = nx.DiGraph()
+DG.add_edge(1, 2, weight=3.0, direction='out')  # 1->2
+DG.add_edge(2, 1, weight=5.0, direction='in')   # 2->1
+
+UG = DG.to_undirected(as_view=True)
+
+# 访问 UG.adj[1][2]
+# 优先返回 _succ[1][2] = {'weight': 3.0, 'direction': 'out'}
+print(UG.adj[1][2])  # {'weight': 3.0, 'direction': 'out'}
+
+# 但这两条边在度计算时都会被统计
+print(UG.degree(1))  # 2（出边和入边各算一条）
+```
+
+这意味着在无向视图中访问边属性时，可能只看到其中一条边的属性。这是设计上的限制。
+
+###### 4.2 性能考虑
+
+Union* 视图的操作有额外开销：
+
+| 操作 | 普通视图 | Union* 视图 |
+|------|----------|-------------|
+| `len()` | O(1) | O(k) 计算并集 |
+| `iter()` | O(k) | O(k) 计算并集 + 迭代 |
+| `__getitem__` | O(1) | O(1) 两次字典查找 |
+
+其中 k 是邻居数量。对于大型图，频繁调用 `len()` 或迭代可能会有性能影响。
+
+###### 4.3 内存效率
+
+虽然有运行时开销，但 Union* 视图的内存效率很高：
+
+```python
+# 每个 Union* 对象只保存两个引用
+class UnionAtlas:
+    __slots__ = ("_succ", "_pred")  # 非常小的内存占用
+```
+
+相比之下，如果创建真正的无向图副本需要 O(m) 内存存储边数据。
+
 #### 3.2.5 Filter* 系列视图
 
 用于子图过滤的视图：
@@ -718,7 +993,499 @@ class FilterAdjacency(Mapping):
 - 惰性过滤：只在访问时检查条件
 - 用于 `subgraph()` 等方法创建子图视图
 
-### 3.3 高级视图类（reportviews.py）
+---
+
+## 3.3 有向图的无向视图合并机制
+
+当有向图需要以无向方式访问时，NetworkX 使用 `Union*` 系列视图来动态合并 `_succ`（出边表）和 `_pred`（入边表）两个邻接表。这是一个典型的**惰性视图合并**设计，不复制任何数据，只在访问时动态计算。
+
+### 3.3.1 触发条件：什么接口调用会走到这条路径？
+
+无向视图的合并机制由 **`graphviews.py`** 中的视图创建逻辑触发，主要有以下三种触发方式：
+
+#### 方式一：`to_undirected(as_view=True)`
+
+这是最常用的触发方式，用户显式要求创建无向视图：
+
+```python
+import networkx as nx
+
+DG = nx.DiGraph()
+DG.add_edge(1, 2, weight=3.0)
+DG.add_edge(2, 3, weight=5.0)
+
+# 触发方式：as_view=True
+UG = DG.to_undirected(as_view=True)
+```
+
+**关键代码路径**（`digraph.py:578-603`）：
+```python
+def to_undirected(self, reciprocal=False, as_view=False):
+    if as_view:
+        from networkx.classes.graphviews import generic_graph_view
+        # 调用 generic_graph_view，create_using=nx.Graph
+        return generic_graph_view(self, create_using=Graph)
+    # ... 否则创建真正的无向图副本
+```
+
+#### 方式二：`generic_graph_view(G, create_using=nx.Graph)`
+
+这是内部核心触发点，在 `graphviews.py:125-129` 中：
+
+```python
+def generic_graph_view(G, create_using=None):
+    # ... 省略前置代码 ...
+    
+    # 核心判断逻辑
+    if newG.is_directed():
+        # 新视图也是有向图：直接使用 _succ 和 _pred
+        pass
+    elif G.is_directed():
+        # 原图是有向图，但新视图要求无向 → 触发 Union* 视图合并
+        if G.is_multigraph():
+            # 多重有向图 → 无向视图
+            newG._adj = UnionMultiAdjacency(G._succ, G._pred)
+        else:
+            # 普通有向图 → 无向视图
+            newG._adj = UnionAdjacency(G._succ, G._pred)
+    
+    # ... 省略后续代码 ...
+```
+
+**触发条件的关键判断**：
+
+| 条件 | 值 | 含义 |
+|------|-----|------|
+| `G.is_directed()` | `True` | 原图是有向图 |
+| `newG.is_directed()` | `False` | 新视图要求无向 |
+| **触发合并** | **是** | 使用 `Union*` 视图 |
+
+#### 方式三：间接触发（如某些视图操作）
+
+某些视图操作可能间接触发这个机制，例如：
+
+```python
+# 某些子图操作可能内部使用 generic_graph_view
+from networkx.classes.graphviews import subgraph_view
+
+# 取决于具体实现，某些 subgraph_view 操作可能触发
+```
+
+#### 完整触发流程图
+
+```
+用户调用
+    │
+    ├── DG.to_undirected(as_view=True)
+    │         │
+    │         └── generic_graph_view(DG, create_using=Graph)
+    │                   │
+    │                   └── 判断：G.is_directed()=True, newG.is_directed()=False
+    │                           │
+    │                           └── 是 → newG._adj = UnionAdjacency(DG._succ, DG._pred)
+    │
+    ├── generic_graph_view(DG, create_using=nx.Graph)
+    │         │
+    │         └── 同上
+    │
+    └── 其他间接调用
+              │
+              └── 内部调用 generic_graph_view
+```
+
+### 3.3.2 合并逻辑：内部如何把出边表和入边表合并成惰性视图？
+
+合并逻辑由 **`coreviews.py`** 中的 `Union*` 系列视图类实现，核心是**惰性合并**——不复制数据，只在访问时动态计算并集。
+
+#### 整体架构：两层 Union 视图
+
+对于非多重有向图，合并涉及两层视图：
+
+```
+用户访问 UG.adj
+         │
+         └── UnionAdjacency（合并 _succ 和 _pred 两个邻接表）
+                   │
+                   ├── 外层节点：直接使用 _succ 的键（节点集相同）
+                   │
+                   └── 访问 UG.adj[u] 时 → 返回 UnionAtlas
+                             │
+                             └── UnionAtlas（合并 _succ[u] 和 _pred[u] 两个邻居字典）
+                                       │
+                                       ├── len()：计算两个字典的键的并集大小
+                                       ├── iter()：迭代两个字典的键的并集
+                                       └── __getitem__(v)：优先查 _succ[u][v]，再查 _pred[u][v]
+```
+
+#### 第一层：UnionAdjacency（邻接表层合并）
+
+**定义位置**：`coreviews.py:165-214`
+
+**核心实现**：
+
+```python
+class UnionAdjacency(Mapping):
+    __slots__ = ("_succ", "_pred")  # 仅保存两个引用，不复制数据
+    
+    def __init__(self, succ, pred):
+        # 断言：两个字典的键（节点）必须相同
+        # 因为有向图中 _succ 和 _pred 的节点集总是一致的
+        assert len(set(succ.keys()) ^ set(pred.keys())) == 0
+        self._succ = succ  # 仅保存引用
+        self._pred = pred  # 仅保存引用
+    
+    def __len__(self):
+        # 两个字典长度相同，直接返回 _succ 的长度
+        return len(self._succ)
+    
+    def __iter__(self):
+        # 直接迭代 _succ 的键（节点集相同）
+        return iter(self._succ)
+    
+    def __getitem__(self, node):
+        # 关键：访问具体节点的邻居时，返回 UnionAtlas
+        # UnionAtlas 负责合并该节点的出边邻居和入边邻居
+        return UnionAtlas(self._succ[node], self._pred[node])
+```
+
+**设计要点**：
+1. **节点集假设**：`_succ` 和 `_pred` 的键（节点）完全相同
+   - 这是有向图的基本不变式：任何节点必须同时出现在 `_succ` 和 `_pred` 中
+   - 即使节点没有出边或入边，也会有一个空字典 `{}`
+2. **延迟合并**：`UnionAdjacency` 本身不做任何合并
+   - `__len__` 和 `__iter__` 直接使用 `_succ`
+   - 只有当访问具体节点 `G.adj[node]` 时，才返回 `UnionAtlas` 进行实际合并
+
+#### 第二层：UnionAtlas（邻居层合并）
+
+**定义位置**：`coreviews.py:110-162`
+
+**核心实现**：
+
+```python
+class UnionAtlas(Mapping):
+    __slots__ = ("_succ", "_pred")  # 仅保存两个引用
+    
+    def __init__(self, succ, pred):
+        # succ: 出边邻居字典 {neighbor: edge_attr_dict, ...}
+        # pred: 入边邻居字典 {neighbor: edge_attr_dict, ...}
+        self._succ = succ
+        self._pred = pred
+    
+    def __len__(self):
+        # 核心：每次访问都动态计算并集大小
+        # _succ.keys() | _pred.keys() = 出边邻居 ∪ 入边邻居
+        return len(self._succ.keys() | self._pred.keys())
+    
+    def __iter__(self):
+        # 核心：每次迭代都动态计算并集
+        return iter(set(self._succ.keys()) | set(self._pred.keys()))
+    
+    def __getitem__(self, key):
+        # 核心：优先从出边找，找不到从入边找
+        try:
+            return self._succ[key]
+        except KeyError:
+            return self._pred[key]
+```
+
+#### 合并逻辑的具体示例
+
+让我们用一个具体例子来理解合并过程：
+
+```python
+DG = nx.DiGraph()
+DG.add_edge(1, 2, weight=3.0)  # 1→2（出边）
+DG.add_edge(3, 1, weight=5.0)  # 3→1（对1来说是入边）
+DG.add_edge(1, 4, weight=7.0)  # 1→4（出边）
+DG.add_edge(2, 1, weight=9.0)  # 2→1（对1来说是入边，双向边）
+```
+
+**底层存储结构**：
+
+```python
+# 节点 1 的出边邻居
+DG._succ[1] = {
+    2: {'weight': 3.0},  # 1→2
+    4: {'weight': 7.0}   # 1→4
+}
+
+# 节点 1 的入边邻居
+DG._pred[1] = {
+    3: {'weight': 5.0},  # 3→1
+    2: {'weight': 9.0}   # 2→1（注意：这是独立的边）
+}
+```
+
+**创建无向视图后**：
+
+```python
+UG = DG.to_undirected(as_view=True)
+
+# UG._adj 是 UnionAdjacency(DG._succ, DG._pred)
+
+# 访问 UG.adj[1] → 返回 UnionAtlas(DG._succ[1], DG._pred[1])
+adj_1 = UG.adj[1]  # UnionAtlas 实例
+```
+
+**UnionAtlas 的行为**：
+
+| 操作 | 实际计算 | 结果 |
+|------|----------|------|
+| `len(adj_1)` | `len({2,4} \| {3,2})` | `3`（邻居：2, 3, 4） |
+| `list(adj_1)` | `list({2,4} \| {3,2})` | `[2, 3, 4]`（顺序不确定） |
+| `adj_1[2]` | 优先查 `_succ[1][2]` | `{'weight': 3.0}`（出边属性） |
+| `adj_1[3]` | 查 `_succ[1][3]` 失败，查 `_pred[1][3]` | `{'weight': 5.0}` |
+
+**注意双向边的处理**：
+- 节点 2 同时在 `_succ[1]` 和 `_pred[1]` 中
+- `adj_1[2]` 优先返回 `_succ[1][2]` 的属性（`weight=3.0`）
+- 但 `_pred[1][2]` 中的边（`weight=9.0`）在度计算时仍然会被统计
+
+#### 多重图的特殊处理：UnionMultiAdjacency + UnionMultiInner
+
+对于多重有向图（`MultiDiGraph`），存储结构是四层嵌套字典，需要额外的视图层：
+
+**存储结构**：
+```
+_succ[node] = {
+    neighbor: {
+        edge_key_0: {edge_attr},  # 边 0
+        edge_key_1: {edge_attr},  # 边 1
+        ...
+    },
+    ...
+}
+```
+
+**视图层次**：
+```
+用户访问 UG.adj[u]
+         │
+         └── UnionMultiInner（合并 _succ[u] 和 _pred[u]）
+                   │
+                   └── 访问 UG.adj[u][v] 时 → 返回 UnionAtlas
+                             │
+                             └── UnionAtlas（合并 _succ[u][v] 和 _pred[u][v] 两个边键字典）
+```
+
+**UnionMultiInner 实现**（`coreviews.py:217-246`）：
+
+```python
+class UnionMultiInner(UnionAtlas):
+    __slots__ = ()  # 复用 UnionAtlas 的 _succ 和 _pred
+    
+    def __getitem__(self, node):
+        in_succ = node in self._succ
+        in_pred = node in self._pred
+        
+        if in_succ:
+            if in_pred:
+                # 双向都有边 → 返回 UnionAtlas 合并两个边键字典
+                return UnionAtlas(self._succ[node], self._pred[node])
+            return UnionAtlas(self._succ[node], {})
+        return UnionAtlas({}, self._pred[node])
+```
+
+**访问层级对比**：
+
+| 图类型 | `G.adj[u]` 返回 | `G.adj[u][v]` 返回 |
+|--------|------------------|---------------------|
+| DiGraph（无向视图） | `UnionAtlas` | 边属性字典 |
+| MultiDiGraph（无向视图） | `UnionMultiInner` | `UnionAtlas`（边键层） |
+
+### 3.3.3 实时更新保证：合并视图如何保证实时反映图的变化？
+
+Union* 系列视图通过**三个核心机制**保证实时更新，即：当原图发生修改时，视图会自动反映这些变化。
+
+#### 机制一：仅保存引用，不复制数据
+
+所有 Union* 视图类都只保存对底层字典的**引用**，不复制任何数据：
+
+```python
+class UnionAtlas(Mapping):
+    __slots__ = ("_succ", "_pred")  # 仅两个引用
+    
+    def __init__(self, succ, pred):
+        self._succ = succ  # 保存引用，不复制
+        self._pred = pred  # 保存引用，不复制
+```
+
+**内存对比**：
+
+| 方式 | 内存占用 | 实时性 |
+|------|----------|--------|
+| 复制数据（如 `dict.copy()`） | O(n) 复制整个字典 | ❌ 快照式，不实时 |
+| 保存引用（Union* 视图） | O(1) 仅两个指针 | ✅ 实时访问原数据 |
+
+#### 机制二：每次访问实时计算
+
+Union* 视图的所有访问方法都**直接访问原始字典**，不缓存任何结果：
+
+```python
+class UnionAtlas(Mapping):
+    def __len__(self):
+        # 每次访问都重新计算并集
+        return len(self._succ.keys() | self._pred.keys())
+    
+    def __iter__(self):
+        # 每次迭代都重新计算并集
+        return iter(set(self._succ.keys()) | set(self._pred.keys()))
+    
+    def __getitem__(self, key):
+        # 每次访问都从原始字典获取
+        try:
+            return self._succ[key]
+        except KeyError:
+            return self._pred[key]
+```
+
+**关键设计**：
+- 没有 `self._cache` 或类似的缓存属性
+- 每次调用都重新计算 `_succ.keys() | _pred.keys()`
+- `__getitem__` 直接查 `_succ` 和 `_pred` 字典
+
+#### 机制三：与 DegreeView 等其他视图的一致性
+
+无向视图的 `degree` 等属性也依赖实时访问：
+
+```python
+# DiDegreeView（用于有向图的度计算）
+class DiDegreeView:
+    def __getitem__(self, n):
+        succs = self._succ[n]  # 实时访问 _succ
+        preds = self._pred[n]  # 实时访问 _pred
+        if weight is None:
+            return len(succs) + len(preds)  # 实时计算
+```
+
+#### 实时更新的完整示例
+
+```python
+import networkx as nx
+
+# 1. 创建有向图
+DG = nx.DiGraph()
+DG.add_edge(1, 2)
+DG.add_edge(2, 3)
+
+# 2. 创建无向视图
+UG = DG.to_undirected(as_view=True)
+
+# 3. 检查初始状态
+print("初始状态：")
+print(f"  UG.edges: {list(UG.edges)}")  # [(1, 2), (2, 3)]
+print(f"  UG.degree(1): {UG.degree(1)}")  # 1（只有 1→2 的出边）
+
+# 4. 修改原图
+print("\n修改原图：添加 3→1 的边")
+DG.add_edge(3, 1)  # 直接修改原图，不涉及视图
+
+# 5. 视图自动更新
+print("\n视图自动更新后：")
+print(f"  UG.edges: {list(UG.edges)}")  # [(1, 2), (2, 3), (3, 1)]
+print(f"  UG.degree(1): {UG.degree(1)}")  # 2（1→2 和 3→1）
+
+# 6. 再修改：删除边
+print("\n再修改：删除 1→2 的边")
+DG.remove_edge(1, 2)
+
+# 7. 视图再次更新
+print("\n视图再次更新后：")
+print(f"  UG.edges: {list(UG.edges)}")  # [(2, 3), (3, 1)]
+print(f"  UG.degree(1): {UG.degree(1)}")  # 1（只有 3→1）
+```
+
+**为什么能自动更新？**
+
+当执行 `DG.add_edge(3, 1)` 时：
+1. `DG._succ[3][1]` 被添加
+2. `DG._pred[1][3]` 被添加
+3. `UG._adj` 是 `UnionAdjacency(DG._succ, DG._pred)`
+4. 当访问 `UG.edges` 时，迭代器最终会访问 `_succ` 和 `_pred`
+5. `UnionAtlas.__iter__()` 会计算 `_succ.keys() | _pred.keys()`
+6. 新添加的边会被包含在并集中
+
+#### 实时更新的边界与注意事项
+
+**什么情况下视图会实时更新？**
+
+| 操作类型 | 示例 | 实时性 |
+|----------|------|--------|
+| 添加边 | `DG.add_edge(u, v)` | ✅ 实时 |
+| 删除边 | `DG.remove_edge(u, v)` | ✅ 实时 |
+| 添加节点 | `DG.add_node(n)` | ✅ 实时 |
+| 删除节点 | `DG.remove_node(n)` | ✅ 实时 |
+| 修改边属性 | `DG.edges[u, v]['weight'] = 5` | ✅ 实时（属性字典是同一引用） |
+
+**什么情况下可能出现问题？**
+
+1. **迭代过程中修改图**：
+
+```python
+# 这可能导致问题
+for u, v in UG.edges:
+    DG.remove_edge(u, v)  # 迭代过程中修改字典
+```
+
+这与 Python 的 `RuntimeError: dictionary changed size during iteration` 是同一类问题。
+
+2. **双向边的属性访问歧义**：
+
+```python
+DG = nx.DiGraph()
+DG.add_edge(1, 2, weight=3.0)  # 1→2，weight=3
+DG.add_edge(2, 1, weight=5.0)  # 2→1，weight=5
+
+UG = DG.to_undirected(as_view=True)
+
+# 访问 UG.adj[1][2]
+# 优先返回 _succ[1][2] = {'weight': 3.0}
+print(UG.adj[1][2])  # {'weight': 3.0}
+
+# 但度计算会统计两条边
+print(UG.degree(1))  # 2（出边和入边各一条）
+```
+
+这是设计权衡：边属性只返回其中一条，但度计算会正确统计。
+
+### 3.3.4 设计权衡与性能分析
+
+#### 性能开销对比
+
+| 操作 | 普通视图（AdjacencyView） | Union* 视图 | 差异 |
+|------|---------------------------|-------------|------|
+| `__len__` | O(1) | O(k) 计算并集 | Union* 更慢 |
+| `__iter__` | O(k) | O(k) 计算并集 + O(k) 迭代 | Union* 略慢 |
+| `__getitem__` | O(1) 一次查找 | O(1) 最多两次查找 | 差异很小 |
+
+其中 k 是邻居数量。
+
+#### 内存效率对比
+
+| 方式 | 内存占用 | 适用场景 |
+|------|----------|----------|
+| 创建真正的无向图副本 | O(m) 复制所有边数据 | 需要持久化修改 |
+| Union* 视图 | O(1) 仅保存引用 | 临时访问、内存敏感场景 |
+
+#### 设计决策总结
+
+NetworkX 选择 Union* 视图而不是复制数据，基于以下权衡：
+
+| 维度 | Union* 视图方案 | 复制数据方案 |
+|------|-----------------|--------------|
+| **内存** | O(1) 极低 | O(m) 复制所有边 |
+| **实时性** | ✅ 自动反映原图变化 | ❌ 快照式，需要手动同步 |
+| **性能** | 访问有额外开销（计算并集） | 访问无额外开销 |
+| **实现复杂度** | 需要 Union* 系列视图类 | 简单，直接复制 |
+| **适用场景** | 临时无向访问、大型图 | 需要持久化无向图 |
+
+**核心设计哲学**：
+> 内存优先，实时性优先。通过惰性计算和引用语义，在保持实时性的同时最小化内存开销。
+
+---
+
+### 3.4 高级视图类（reportviews.py）
 
 `reportviews.py` 定义了面向用户的高级视图，提供更丰富的接口。
 
