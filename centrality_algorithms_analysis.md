@@ -124,8 +124,23 @@ normalized : bool, optional (default=True)
 - 原始设计，直接使用邻接矩阵
 
 **无向图**：
-- 自动转换为有向图，每条边变为两个方向的边
-- 实现 (pagerank_alg.py:128)：`D = G.to_directed()`
+- 不同实现版本处理方式不同：
+
+  **1. 纯 Python 版本 (`_pagerank_python`)**：
+  - 显式转换为有向图，每条边变为两个方向的边
+  - 实现 (pagerank_alg.py:128)：`D = G.to_directed()`
+
+  **2. SciPy 稀疏矩阵版本 (`_pagerank_scipy`，默认版本)**：
+  - 不调用 `to_directed()`，直接通过 `nx.to_scipy_sparse_array(G, ...)` 构建邻接矩阵
+  - 对于无向图，`to_scipy_sparse_array` 生成**对称矩阵**，隐式表示双向边
+  - 实现 (pagerank_alg.py:460)：`A = nx.to_scipy_sparse_array(G, nodelist=nodelist, weight=weight, dtype=float)`
+
+  **3. NumPy 稠密矩阵版本 (`_pagerank_numpy`)**：
+  - 调用 `google_matrix()`，内部通过 `nx.to_numpy_array(G, ...)` 构建矩阵
+  - 同样依赖无向图邻接矩阵的**对称性**隐式处理双向边
+  - `google_matrix` 的文档声明："Undirected graphs will be converted to a directed graph with two directed edges for each undirected edge."，但实际是通过对称矩阵实现的
+
+- 最终效果：所有版本在无向图上每条边都被视为双向的（入边和出边都计数）
 
 #### Katz 中心性
 
