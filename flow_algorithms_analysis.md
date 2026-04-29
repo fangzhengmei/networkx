@@ -648,6 +648,771 @@ def multi_source_multi_sink_flow(G, sources, targets, capacity="capacity"):
 
 ---
 
+## 7. 路径增广类算法的双向搜索优化
+
+### 7.1 Edmonds-Karp 的双向 BFS 实现机制
+
+Edmonds-Karp 算法是 Ford-Fulkerson 框架的经典实现，其核心优化在于使用**双向广度优先搜索**（而非单向）来寻找最短增广路径。这一优化在实践中显著减少了搜索空间。
+
+#### 7.1.1 两侧队列的交替扩展逻辑
+
+**核心实现**（`edmondskarp.py:40-69`）：
+
+```python
+def bidirectional_bfs():
+    """Bidirectional breadth-first search for an augmenting path."""
+    pred = {s: None}  # 源点方向的父节点映射：节点 → 前驱
+    q_s = [s]          # 源点搜索队列
+    succ = {t: None}  # 汇点方向的后继节点映射：节点 → 后继（反向路径）
+    q_t = [t]          # 汇点搜索队列
+    
+    while True:
+        q = []
+        # 关键优化：始终选择较小的队列进行扩展
+        if len(q_s) <= len(q_t):
+            # 从源点方向扩展（正向遍历）
+            for u in q_s:
+                for v, attr in R_succ[u].items():
+                    if v not in pred and attr["flow"] < attr["capacity"]:
+                        pred[v] = u
+                        if v in succ:  # 相遇检测
+                            return v, pred, succ
+                        q.append(v)
+            if not q:
+                return None, None, None
+            q_s = q
+        else:
+            # 从汇点方向扩展（反向遍历，使用 R_pred）
+            for u in q_t:
+                for v, attr in R_pred[u].items():
+                    if v not in succ and attr["flow"] < attr["capacity"]:
+                        succ[v] = u
+                        if v in pred:  # 相遇检测
+                            return v, pred, succ
+                        q.append(v)
+            if not q:
+                return None, None, None
+            q_t = q
+```
+
+#### 7.1.2 交替扩展策略分析
+
+**为什么选择较小的队列扩展？**
+
+这是双向搜索的经典优化策略：
+
+1. **减少总探索节点数**：
+   - 单向 BFS：可能需要探索 $O(b^d)$ 个节点（$b$ 为分支因子，$d$ 为距离）
+   - 双向 BFS：只需探索 $O(b^{d/2}) + O(b^{d/2})$ 个节点
+   - 选择较小队列：保证最坏情况下也是最优的
+
+2. **NetworkX 实现的特殊性**：
+   - 源点方向使用 `R_succ`（正向边：`u→v` 的残余容量 = `capacity - flow`）
+   - 汇点方向使用 `R_pred`（反向边：等价于搜索 `v→u` 的正向残余容量）
+
+#### 7.1.3 相遇节点检测与路径拼接
+
+**路径拼接逻辑**（`edmondskarp.py:77-88`）：
+
+```python
+v, pred, succ = bidirectional_bfs()
+if pred is None:
+    break
+
+# 1. 从相遇节点回溯到源点
+path = [v]
+u = v
+while u != s:
+    u = pred[u]
+    path.append(u)
+path.reverse()  # 现在 path 是 s → ... → v
+
+# 2. 从相遇节点追溯到汇点
+u = v
+while u != t:
+    u = succ[u]
+    path.append(u)  # path 变为 s → ... → v → ... → t
+```
+
+**数据结构设计**：
+
+| 方向 | 映射关系 | 含义 | 遍历方式 |
+|------|---------|------|---------|
+| **源点方向** | `pred[v] = u` | 最短路径中 `v` 的前驱是 `u` | 正向遍历 `R_succ` |
+| **汇点方向** | `succ[v] = u` | 最短路径中 `v` 的后继是 `u` | 反向遍历 `R_pred` |
+
+**注意**：汇点方向的 `succ` 命名容易产生误解。实际上：
+- `succ` 存储的是**从汇点出发的反向路径**
+- `succ[v] = u` 意味着在反向搜索中，`v` 的下一个节点是 `u`
+- 这等价于在正向路径中 `u` → `v`
+
+### 7.2 与 Boykov-Kolmogorov 双搜索树的本质差异
+
+虽然 Edmonds-Karp 和 Boykov-Kolmogorov 都采用了"双向"的思想，但它们在**双向的维度**上有本质区别。
+
+#### 7.2.1 双向搜索策略对比
+
+| 维度 | Edmonds-Karp 双向 BFS | Boykov-Kolmogorov 双搜索树 |
+|------|---------------------|--------------------------|
+| **搜索目标** | 寻找**一条**最短增广路径 | 生长**持久化**的搜索树 |
+| **搜索状态** | 每次增广后**全部丢弃** | 增广后**尽量复用** |
+| **数据结构** | 临时队列 + 父指针字典 | 持久化搜索树 + 活跃节点队列 |
+| **相遇处理** | 找到路径立即返回 | 找到连接边后进入增广阶段 |
+| **路径复用** | 无 | 通过 Adoption 阶段修复 |
+
+#### 7.2.2 Edmonds-Karp：一次性路径搜索
+
+**生命周期**：
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Edmonds-Karp 主循环                       │
+├─────────────────────────────────────────────────────────────┤
+│  while flow_value < cutoff:                                   │
+│      ┌─────────────────────────────────────────────────────┐ │
+│      │  bidirectional_bfs()                                 │ │
+│      │  - 初始化 pred = {s: None}, succ = {t: None}       │ │
+│      │  - 交替扩展 q_s 和 q_t                               │ │
+│      │  - 找到相遇节点 v 后返回 (v, pred, succ)            │ │
+│      │  - 若未找到，返回 (None, None, None)                 │ │
+│      └─────────────────────────────────────────────────────┘ │
+│      if pred is None: break                                   │
+│      ┌─────────────────────────────────────────────────────┐ │
+│      │  augment(path)                                       │ │
+│      │  - 计算路径残余容量                                  │ │
+│      │  - 沿路径增广流量                                    │ │
+│      └─────────────────────────────────────────────────────┘ │
+│      ↓ pred 和 succ 被丢弃，下次循环重新构建                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键特征**：
+1. **无状态性**：每次 `bidirectional_bfs()` 调用都是独立的
+2. **最短路径保证**：双向 BFS 天然保证找到的是最短路径（边数最少）
+3. **路径长度递增**：每次增广后，最短增广路径的长度**不会减少**（这是 Edmonds-Karp 复杂度证明的关键）
+
+#### 7.2.3 Boykov-Kolmogorov：持久化搜索树
+
+**生命周期**：
+```
+┌─────────────────────────────────────────────────────────────┐
+│              Boykov-Kolmogorov 三阶段循环                     │
+├─────────────────────────────────────────────────────────────┤
+│  初始化:                                                       │
+│    source_tree = {s: None}  ← 持久化源树                     │
+│    target_tree = {t: None}  ← 持久化汇树                     │
+│    active = deque([s, t])   ← 待扩展节点队列                 │
+│                                                               │
+│  while flow_value < cutoff:                                   │
+│      ┌─────────────────────────────────────────────────────┐ │
+│      │  GROW 阶段                                            │ │
+│      │  - 从 active 队列取节点扩展                          │ │
+│      │  - 源树节点: 正向扩展 R_succ，加入 source_tree       │ │
+│      │  - 汇树节点: 反向扩展 R_pred，加入 target_tree       │ │
+│      │  - 发现连接边 (u∈source_tree, v∈target_tree)        │ │
+│      │    立即返回 (u, v)                                   │ │
+│      └─────────────────────────────────────────────────────┘ │
+│      if u is None: break  ← 无法生长，算法终止                │
+│                                                               │
+│      ┌─────────────────────────────────────────────────────┐ │
+│      │  AUGMENT 阶段                                         │ │
+│      │  - 从 u 回溯到 s: source_tree[u], source_tree[...],  │ │
+│      │  - 从 v 追溯到 t: target_tree[v], target_tree[...],  │ │
+│      │  - 合并为完整路径 s→...→u→v→...→t                   │ │
+│      │  - 沿路径增广流量                                     │ │
+│      │  - 标记饱和边对应的节点为孤儿 (orphans)               │ │
+│      └─────────────────────────────────────────────────────┘ │
+│                                                               │
+│      ┌─────────────────────────────────────────────────────┐ │
+│      │  ADOPTION 阶段（核心差异！）                          │ │
+│      │  - 处理 orphans 队列中的孤儿节点                     │ │
+│      │  - 尝试为孤儿找到新父节点（同树内）                   │ │
+│      │  - 若找不到，则从树中删除，并将其子节点也变为孤儿    │ │
+│      │  - 搜索树被修复，可继续用于下次 GROW                  │ │
+│      └─────────────────────────────────────────────────────┘ │
+│      ↓ source_tree 和 target_tree 被保留，继续使用            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2.4 本质差异总结
+
+| 特性 | Edmonds-Karp 双向 BFS | Boykov-Kolmogorov 双搜索树 |
+|------|---------------------|--------------------------|
+| **双向的含义** | 单次路径搜索的双向加速 | 持久化数据结构的双向维护 |
+| **状态保持** | 无状态，每次重建 | 有状态，搜索树持久化 |
+| **路径寻找** | 每次寻找完整路径 | 利用已有树结构拼接路径 |
+| **增广代价** | 每次需重新搜索 | 只需修复被破坏的树 |
+| **复杂度** | $O(n m^2)$（最坏） | $O(n^2 m |C|)$（最坏） |
+| **实践性能** | 稀疏网络表现好 | 网格图/图像分割极快 |
+| **最短路径** | 保证最短路径 | 不保证，但有标记启发式 |
+
+**核心洞察**：
+- **Edmonds-Karp** 的"双向"是**算法层面**的优化：用更少的步骤找到同一条路径
+- **Boykov-Kolmogorov** 的"双向"是**数据结构层面**的设计：用两棵树覆盖更多节点，减少重复探索
+
+### 7.3 标记启发式（Marking Heuristic）
+
+Boykov-Kolmogorov 的搜索树虽然不保证最短路径，但通过**时间戳 + 距离**的标记启发式来维护路径质量。
+
+**实现**（`boykovkolmogorov.py:347-348`）：
+```python
+def _is_closer(u, v):
+    """检查 u 是否提供到 v 的更短路径"""
+    return timestamp[v] <= timestamp[u] and dist[v] > dist[u] + 1
+```
+
+**GROW 阶段中的应用**（`boykovkolmogorov.py:231-234`）：
+```python
+elif v in this_tree and _is_closer(u, v):
+    # v 已在树中，但 u 提供了更短的路径
+    this_tree[v] = u           # 更新父指针
+    dist[v] = dist[u] + 1      # 更新距离
+    timestamp[v] = timestamp[u] # 更新时间戳
+```
+
+**时间戳的作用**：
+- `time` 变量在每次 AUGMENT 后递增
+- `timestamp[v]` 记录节点 v 最后一次被处理的"时间"
+- `timestamp[v] <= timestamp[u]` 保证 u 的信息不"过期"
+
+---
+
+## 8. Dinitz 算法的分层图机制
+
+Dinitz 算法是路径增广类算法的重大改进，其核心创新在于**分层图（Level Graph）**和**阻塞流（Blocking Flow）**的组合。
+
+### 8.1 分层图的构建
+
+#### 8.1.1 BFS 分层机制
+
+**核心实现**（`dinitz_alg.py:180-198`）：
+
+```python
+def breath_first_search():
+    """构建分层图：只保留最短路径上的边"""
+    parents = {}              # 记录每个节点的父节点列表（允许多父）
+    vertex_dist = {s: 0}      # 节点到源点的距离（层数）
+    queue = deque([(s, 0)])
+    
+    while queue:
+        if t in parents:
+            break  # 汇点已可达，提前终止（但仍需处理当前层）
+        u, dist = queue.popleft()
+        
+        for v, attr in R_succ[u].items():
+            if attr["capacity"] - attr["flow"] > 0:  # 边有残余容量
+                if v in parents:
+                    # v 已被访问，但可能通过同层另一条路径到达
+                    if vertex_dist[v] == dist + 1:
+                        parents[v].append(u)  # 增加一个父节点
+                else:
+                    # v 首次被访问
+                    parents[v] = deque([u])
+                    vertex_dist[v] = dist + 1
+                    queue.append((v, dist + 1))
+    return parents
+```
+
+#### 8.1.2 分层图的关键性质
+
+**分层图定义**：
+- 只包含满足 `dist[v] == dist[u] + 1` 的边 `u→v`
+- 所有路径都是从 s 到 t 的**最短路径**（边数最少）
+- 是一个 **DAG（有向无环图）**，边只从低层指向高层
+
+**多层父节点设计**：
+```python
+# 允许多个父节点：v 可以通过 u1 或 u2 到达，距离相同
+parents[v] = deque([u1, u2, ...])
+```
+
+这允许 DFS 在寻找阻塞流时探索多条路径，而无需重新 BFS。
+
+### 8.2 阻塞流的寻找与推进
+
+#### 8.2.1 DFS 寻找阻塞流
+
+**核心实现**（`dinitz_alg.py:200-234`）：
+
+```python
+def depth_first_search(parents):
+    """在分层图中寻找所有增广路径（阻塞流）"""
+    total_flow = 0
+    u = t              # 从汇点开始反向 DFS（巧妙设计！）
+    path = [u]         # 路径栈
+    
+    while True:
+        if len(parents[u]) > 0:
+            # u 有可用父节点，向前探索
+            v = parents[u][0]
+            path.append(v)
+        else:
+            # u 无可用父节点，回溯
+            path.pop()
+            if len(path) == 0:
+                break  # 无更多路径
+            v = path[-1]
+            parents[v].popleft()  # 移除失效的边
+        
+        # 检查是否到达源点（找到完整路径）
+        if v == s:
+            # 1. 计算路径残余容量
+            flow = INF
+            for u_node, v_node in pairwise(path):
+                # path 是 t → ... → s，所以用 R_pred 访问反向边
+                flow = min(flow, R_pred[u_node][v_node]["capacity"] - 
+                          R_pred[u_node][v_node]["flow"])
+            
+            # 2. 沿路径增广
+            for u_node, v_node in pairwise(reversed(path)):
+                # reversed(path) 是 s → ... → t
+                R_pred[v_node][u_node]["flow"] += flow
+                R_pred[u_node][v_node]["flow"] -= flow
+                
+                # 3. 检查边是否饱和
+                if R_pred[v_node][u_node]["capacity"] - R_pred[v_node][u_node]["flow"] == 0:
+                    parents[v_node].popleft()  # 从可用父节点中移除
+                    # 回溯到饱和边的起点
+                    while path[-1] != v_node:
+                        path.pop()
+            
+            total_flow += flow
+            v = path[-1]
+        u = v
+    return total_flow
+```
+
+#### 8.2.2 反向 DFS 的设计洞察
+
+**为什么从汇点开始？**
+
+常规 DFS（从 s 到 t）：
+```
+s → a → b → c → t  (路径1)
+s → a → d → t      (路径2)
+```
+- 找到路径1后，可能需要多次回溯才能找到路径2
+
+反向 DFS（从 t 到 s）：
+```
+path = [t]
+探索 t 的父节点 → 加入 path
+...
+直到 path[0] == s
+```
+- 利用 `parents` 结构保证每步都朝向源点
+- 更高效的回溯和饱和边处理
+
+#### 8.2.3 阻塞流的定义
+
+**阻塞流**：在分层图中，**无法再找到任何增广路径**时的流。
+
+注意：阻塞流 ≠ 最大流！
+- 阻塞流是**当前分层图**中的最大流
+- 增广后，最短路径长度**严格增加**
+- 需要重新 BFS 构建新的分层图
+
+### 8.3 饱和边与层次回退
+
+#### 8.3.1 主循环结构
+
+**完整迭代**（`dinitz_alg.py:236-244`）：
+
+```python
+flow_value = 0
+while flow_value < cutoff:
+    # 阶段1: BFS 构建分层图
+    parents = breath_first_search()
+    if t not in parents:
+        break  # 汇点不可达，已达最大流
+    
+    # 阶段2: DFS 寻找阻塞流
+    this_flow = depth_first_search(parents)
+    if this_flow * 2 > INF:
+        raise nx.NetworkXUnbounded("Infinite capacity path")
+    
+    flow_value += this_flow
+    # 隐式层次回退：下次 BFS 将构建新的分层图
+```
+
+#### 8.3.2 与 Edmonds-Karp 的逐条增广对比
+
+**Edmonds-Karp 模式**：
+```
+循环:
+    BFS 找一条最短路径
+    增广这条路径
+    重复
+```
+- 每次增广可能只推送少量流量
+- 需要 $O(m)$ 次 BFS（最坏情况）
+
+**Dinitz 模式**：
+```
+循环:
+    BFS 构建分层图 (1次)
+    DFS 推送阻塞流 (可能多条路径)
+    重复
+```
+- 一次 BFS 后推送尽可能多的流量
+- BFS 次数 = 最短路径长度的增加次数 ≤ $O(n)$
+
+#### 8.3.3 效率差异分析
+
+**理论复杂度**：
+
+| 算法 | 时间复杂度 | 单位容量网络 |
+|------|-----------|-------------|
+| Edmonds-Karp | $O(n m^2)$ | $O(n m^2)$ |
+| Dinitz | $O(n^2 m)$ | $O(m \sqrt{n})$ |
+
+**实际差异来源**：
+
+1. **BFS 次数减少**：
+   - Edmonds-Karp：每次增广可能需要一次 BFS
+   - Dinitz：BFS 次数 = 层次数 ≤ $n$
+
+2. **DFS 效率**：
+   - 分层图是 DAG，无环
+   - 每层只处理一次
+   - 使用 `CurrentEdge` 类优化邻接表遍历
+
+3. **饱和边处理**：
+   - 边饱和后从 `parents` 中移除
+   - 下次 DFS 不会再探索这些边
+
+### 8.4 Shortest Augmenting Path 的层次优化
+
+Shortest Augmenting Path 算法与 Dinitz 有相似的层次思想，但实现方式不同。
+
+**距离标签（Height Label）**（`shortestaugmentingpath.py:38-61`）：
+```python
+# 从汇点反向 BFS 初始化高度
+heights = {t: 0}
+q = deque([(t, 0)])
+while q:
+    u, height = q.popleft()
+    height += 1
+    for v, attr in R_pred[u].items():
+        if v not in heights and attr["flow"] < attr["capacity"]:
+            heights[v] = height
+            q.append((v, height))
+```
+
+**许可边（Admissible Edge）**：
+- 只有满足 `height[u] == height[v] + 1` 的边 `u→v` 才被考虑
+- 这保证了每次增广都是最短路径
+
+**间隙启发式（Gap Heuristic）**（`shortestaugmentingpath.py:63-66, 123-129`）：
+```python
+counts = [0] * (2 * n - 1)
+for u in R:
+    counts[R_nodes[u]["height"]] += 1
+
+# 当某层计数变为 0 时
+counts[height] -= 1
+if counts[height] == 0:
+    # 间隙出现！更高层的节点无法到达汇点
+    R.graph["flow_value"] = flow_value
+    return R
+```
+
+### 8.5 分层图与距离标签的对比
+
+| 特性 | Dinitz 分层图 | Shortest Augmenting Path 距离标签 |
+|------|-------------|----------------------------------|
+| **数据结构** | BFS 构建的 `parents` 字典 | 每个节点的 `height` 属性 |
+| **更新时机** | 每次阻塞流后重新 BFS | 节点重标签时动态更新 |
+| **路径保证** | 只在分层图内搜索 | 检查许可边条件 |
+| **提前终止** | 汇点不在 `parents` 中 | 间隙启发式 |
+| **复杂度** | $O(n^2 m)$ | $O(n^2 m)$ |
+| **单位容量** | - | $O(\min(n^{2/3}, m^{1/2}) m)$ 两阶段优化 |
+
+**核心差异**：
+- **Dinitz**：显式构建分层图，一次性推送阻塞流
+- **SAP**：隐式通过高度标签维护层次，每次推送一条路径但有更激进的启发式
+
+---
+
+## 9. 连通性模块中的超级源/汇归约
+
+NetworkX 的连通性计算（节点连通度、边连通度）是最大流算法的重要应用场景。这些问题通过**图变换**归约为单源单汇最大流问题。
+
+### 9.1 节点连通度的归约：节点分裂技术
+
+#### 9.1.1 问题背景
+
+**节点连通度**（Node Connectivity）$\kappa(G)$：
+- 最少需要删除多少个节点才能使图不连通
+- 或使特定的源汇对 $s, t$ 不连通（局部节点连通度）
+
+**难点**：
+- 最大流算法天然处理**边**的容量约束
+- 如何建模**节点**的"删除代价"？
+
+#### 9.1.2 节点分裂技术
+
+**核心思想**：将每个节点 $v$ 拆分为两个节点 $v_A$ 和 $v_B$，用一条内部边连接。
+
+**辅助图构建**（`connectivity/utils.py:10-60`）：
+
+```python
+def build_auxiliary_node_connectivity(G):
+    directed = G.is_directed()
+    mapping = {}
+    H = nx.DiGraph()
+    
+    # 阶段1: 分裂每个节点
+    for i, node in enumerate(G):
+        mapping[node] = i
+        # 创建两个节点：vA 和 vB
+        H.add_node(f"{i}A", id=node)  # 入节点
+        H.add_node(f"{i}B", id=node)  # 出节点
+        # 添加内部边 vA → vB，容量 = 1
+        # 割这条边等价于"删除"原节点 v
+        H.add_edge(f"{i}A", f"{i}B", capacity=1)
+    
+    # 阶段2: 转换原图边
+    edges = []
+    for source, target in G.edges():
+        # 原图边 u→v 变为 uB → vA
+        # 容量 = 1（或无穷大，取决于实现）
+        edges.append((f"{mapping[source]}B", f"{mapping[target]}A"))
+        if not directed:
+            # 无向图需要双向边
+            edges.append((f"{mapping[target]}B", f"{mapping[source]}A"))
+    H.add_edges_from(edges, capacity=1)
+    
+    H.graph["mapping"] = mapping
+    return H
+```
+
+#### 9.1.3 分裂后的图结构
+
+**原图**：
+```
+s -----> a -----> t
+ \              /
+  \----> b ----/
+```
+
+**辅助图**：
+```
+sA --1--> sB --1--> aA --1--> aB --1--> tA --1--> tB
+           \                          /
+            \----1--> bA --1--> bB --/
+```
+
+**关键观察**：
+1. 每个内部边 `vA→vB` 容量为 1
+2. 原图边 `u→v` 变为 `uB→vA`，容量为 1
+3. 要从 `sB` 到 `tA`，必须经过一系列 `xA→xB` 边
+
+#### 9.1.4 源汇对的选择
+
+**节点割计算**（`connectivity/cuts.py:167-306`）：
+
+```python
+def minimum_st_node_cut(G, s, t, flow_func=None, auxiliary=None, residual=None):
+    # 构建辅助图
+    if auxiliary is None:
+        H = build_auxiliary_node_connectivity(G)
+    
+    mapping = H.graph["mapping"]
+    
+    # 关键：源点用 B 节点，汇点用 A 节点
+    # 源点 s: 从 sB 出发（绕过 sA→sB 边）
+    # 汇点 t: 到达 tA 结束（绕过 tA→tB 边）
+    edge_cut = minimum_st_edge_cut(H, f"{mapping[s]}B", f"{mapping[t]}A", **kwargs)
+    
+    # 转换回原图节点
+    # 辅助图中的边割 (vA, vB) 对应原图节点 v
+    node_cut = {H.nodes[node]["id"] for edge in edge_cut for node in edge}
+    return node_cut - {s, t}  # 排除源汇本身
+```
+
+**为什么源用 B、汇用 A？**
+
+- 如果源点是 `sA`：割 `sA→sB` 会把源点"删除"，这不是我们想要的
+- 如果汇点是 `tB`：割 `tA→tB` 会把汇点"删除"，这也不是我们想要的
+- 正确选择：`sB` 出发，`tA` 到达，这样只有**中间节点**的内部边会被割
+
+### 9.2 边连通度的归约
+
+#### 9.2.1 边连通度问题
+
+**边连通度**（Edge Connectivity）$\lambda(G)$：
+- 最少需要删除多少条边才能使图不连通
+
+**相比节点连通度**：
+- 边连通度更"自然"地对应最大流
+- 无需节点分裂，只需简单的图变换
+
+#### 9.2.2 辅助图构建
+
+**实现**（`connectivity/utils.py:63-88`）：
+
+```python
+def build_auxiliary_edge_connectivity(G):
+    if G.is_directed():
+        # 有向图：直接添加 capacity=1
+        H = nx.DiGraph()
+        H.add_nodes_from(G.nodes())
+        H.add_edges_from(G.edges(), capacity=1)
+        return H
+    else:
+        # 无向图：每条边替换为两条反向边
+        H = nx.DiGraph()
+        H.add_nodes_from(G.nodes())
+        for source, target in G.edges():
+            # u-v 变为 u→v 和 v→u，各 capacity=1
+            H.add_edges_from([(source, target), (target, source)], capacity=1)
+        return H
+```
+
+#### 9.2.3 无向图的双向边
+
+**原图**（无向）：
+```
+s ------ a ------ t
+ \              /
+  \------ b ----/
+```
+
+**辅助图**（有向）：
+```
+s <--1--> a <--1--> t
+ \              /
+  \<--1--> b <--/
+```
+
+每条无向边 `u-v` 变为两条有向边 `u→v` 和 `v→u`，容量均为 1。
+
+### 9.3 两类辅助图的结构对比
+
+| 特性 | 节点连通度辅助图 | 边连通度辅助图 |
+|------|-----------------|---------------|
+| **节点数** | $2n$（每个原节点分裂为 2 个） | $n$（与原图相同） |
+| **边数** | $m + n$（原图边 + 内部边） | $2m$（无向）或 $m$（有向） |
+| **核心变换** | 节点分裂 + 内部边 | 无向边转双向有向边 |
+| **容量约束** | 内部边 capacity=1 | 所有边 capacity=1 |
+| **源汇选择** | 源用 B 节点，汇用 A 节点 | 源汇与原图相同 |
+| **割的含义** | 割内部边 = 删除节点 | 割原图边 = 删除边 |
+
+### 9.4 完整归约示例
+
+#### 9.4.1 节点连通度计算示例
+
+**原图**：
+```
+s -- a -- t
+|    |    |
++----b----+
+```
+
+这是一个 2-节点连通图（删除 s 或 t 不算，需要删除 a 和 b）。
+
+**辅助图**：
+```
+sA--1-->sB--1-->aA--1-->aB--1-->tA--1-->tB
+ |       |       |       |       |
+ |       +--1-->bA--1-->bB--1-->+
+ |               |
+ +--------1------+
+```
+
+**最大流计算**：
+- 源点：`sB`
+- 汇点：`tA`
+- 最大流值 = 2（一条经过 a，一条经过 b）
+- 这对应节点连通度 = 2
+
+**最小割**：
+- 割集可能包含 `(aA, aB)` 和 `(bA, bB)`
+- 对应原图节点 {a, b}
+
+#### 9.4.2 边连通度计算示例
+
+**同一张原图**：
+
+**辅助图**（无向转双向有向）：
+```
+s <--1--> a <--1--> t
+^         ^         ^
+|         |         |
++----1----+----1----+
+         b
+```
+
+**最大流计算**：
+- 源点：`s`
+- 汇点：`t`
+- 最大流值 = 3（s→a→t, s→b→t, s→a→b→t...）
+- 实际边连通度 = 2（删除 s-a 和 s-b）
+
+**注意**：边连通度的最大流值可能大于实际连通度，需要考虑所有可能的源汇对。
+
+### 9.5 全局连通度的多源多汇归约
+
+#### 9.5.1 全局最小节点割
+
+**实现**（`connectivity/cuts.py:309-452`）：
+
+```python
+def minimum_node_cut(G, s=None, t=None, flow_func=None):
+    # 局部最小割：指定源汇
+    if s is not None and t is not None:
+        return minimum_st_node_cut(G, s, t, flow_func=flow_func)
+    
+    # 全局最小割：遍历所有节点对
+    # 选择度数最小的节点作为基准
+    v = min(G, key=G.degree)
+    
+    # 初始割集：v 的所有邻居
+    min_cut = set(G[v])
+    
+    # 计算 v 到所有非邻居的节点割
+    for w in set(G) - set(neighbors(v)) - {v}:
+        this_cut = minimum_st_node_cut(G, v, w, **kwargs)
+        if len(min_cut) >= len(this_cut):
+            min_cut = this_cut
+    
+    # 还需检查 v 的邻居之间的割
+    for x, y in iter_func(neighbors(v), 2):
+        if y in G[x]:
+            continue  # 直接相连，无法通过节点割分离
+        this_cut = minimum_st_node_cut(G, x, y, **kwargs)
+        if len(min_cut) >= len(this_cut):
+            min_cut = this_cut
+    
+    return min_cut
+```
+
+#### 9.5.2 本质：多次单源单汇计算
+
+全局连通度没有"自然"的超级源/汇归约，但可以：
+1. 选择一个基准节点 $v$
+2. 计算 $v$ 到所有其他节点的局部连通度
+3. 取最小值
+
+这等价于**多次独立的单源单汇最大流计算**，而非单次多源多汇归约。
+
+### 9.6 归约策略总结
+
+| 问题类型 | 归约方法 | 关键变换 |
+|---------|---------|---------|
+| **局部节点连通度** | 节点分裂 + 单源单汇 | $v \to (vA, vB)$，边 $vA→vB$ capacity=1 |
+| **局部边连通度** | 单向/双向边 + 单源单汇 | 无向边转两条有向边，capacity=1 |
+| **全局节点连通度** | 多次局部计算 | 遍历节点对，取最小割 |
+| **全局边连通度** | 多次局部计算 | 遍历节点对，取最小割 |
+| **多源多汇最大流** | 超级源/汇 | 添加 $S^*$ 连所有源，$T^*$ 连所有汇 |
+
+**核心洞察**：
+- 节点连通度的**节点分裂**是最巧妙的图变换
+- 它将"删除节点"的离散操作转化为"割边"的连续优化问题
+- 最大流-最小割定理自然适用于这种变换后的图
+
+---
+
 ## 6. 架构设计总结
 
 ### 6.1 层次化架构
