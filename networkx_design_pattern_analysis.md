@@ -679,7 +679,9 @@ def to_numpy_array(
 
 #### NumPy 数组转图 (`from_numpy_array`)
 
-从邻接矩阵创建图，位于 `networkx/convert_matrix.py:714`：
+从邻接矩阵创建图，位于 `networkx/convert_matrix.py:1132`。**需要特别注意：上三角过滤只针对无向多重图，普通无向图依靠数据结构本身的对称性隐式去重。**
+
+##### 核心实现逻辑
 
 ```python
 def from_numpy_array(
@@ -688,38 +690,102 @@ def from_numpy_array(
     create_using=None,
     edge_attr="weight",
     *,
+    nodelist=None,
     nonedge=0,
 ):
-    """Returns a graph from NumPy array."""
+    """Returns a graph from a 2D NumPy array."""
     
     G = nx.empty_graph(0, create_using)
+    # ... 节点添加逻辑 ...
     
-    # 获取节点数量
-    n = A.shape[0]
-    
-    # 添加节点
-    G.add_nodes_from(range(n))
-    
-    # 根据图类型处理边
-    if G.is_directed():
-        # 有向图：遍历所有非零元素
-        for i, j in zip(*np.where(A != nonedge)):
-            if i == j:
-                # 自环
-                G.add_edge(i, j, **{edge_attr: A[i, j]})
-            else:
-                G.add_edge(i, j, **{edge_attr: A[i, j]})
+    # 生成边三元组 (u, v, data)
+    if python_type is int and G.is_multigraph() and parallel_edges:
+        # 多重图并行边模式
+        triples = chain(((u, v, {edge_attr: 1}) for d in range(A[u, v])) for (u, v) in edges)
     else:
-        # 无向图：只遍历上三角（包括对角线）
-        for i, j in zip(*np.where(np.triu(A) != nonedge)):
-            G.add_edge(i, j, **{edge_attr: A[i, j]})
+        # 普通模式
+        triples = ((u, v, {edge_attr: python_type(A[u, v])}) for u, v in edges)
     
+    # ⚠️ 关键：上三角过滤只针对无向多重图
+    if G.is_multigraph() and not G.is_directed():
+        # 无向多重图：只使用上三角（包括对角线）
+        triples = ((u, v, d) for u, v, d in triples if u <= v)
+    
+    # 节点重映射（如果需要）
+    if not _default_nodes:
+        idx_to_node = dict(enumerate(nodelist))
+        triples = ((idx_to_node[u], idx_to_node[v], d) for u, v, d in triples)
+    
+    G.add_edges_from(triples)
     return G
 ```
 
-**关键差异**：
-- **有向图**：遍历整个矩阵，`A[i, j]` 表示 i→j 的边
-- **无向图**：只遍历上三角矩阵，避免重复添加边
+##### 不同图类型的处理差异
+
+| 图类型 | 遍历范围 | 去重机制 | 原因 |
+|--------|----------|----------|------|
+| **有向图**（包括 `DiGraph` 和 `MultiDiGraph`） | 整个矩阵 | 无 | 每条边是单向的，`A[i,j]` 和 `A[j,i]` 是独立的 |
+| **普通无向图**（`Graph`） | 整个矩阵 | `add_edges_from` 隐式去重 | 对称矩阵中 `A[i,j]` 和 `A[j,i]` 都表示同一条边，但 `G.add_edge(i,j)` 会自动处理 |
+| **无向多重图**（`MultiGraph`） | 上三角矩阵（`u <= v`） | 显式过滤 | 多重图中 `add_edge(i,j)` 每次都会创建新边，必须显式避免重复 |
+
+##### 普通无向图的隐式去重机制
+
+对于普通无向图（`Graph`），即使遍历整个矩阵，`add_edges_from` 也会自动去重：
+
+```python
+# 假设对称矩阵 A[i,j] = A[j,i] = 1
+G = nx.Graph()
+G.add_edge(0, 1, weight=1)  # 第一次添加
+G.add_edge(0, 1, weight=1)  # 第二次添加：更新属性，不创建新边
+
+# 结果：只有一条边 (0, 1)
+print(G.number_of_edges())  # 1
+```
+
+这是因为 `Graph.add_edge` 的实现会检查边是否已存在，如果存在则更新属性而不是创建新边。
+
+##### 无向多重图的显式过滤
+
+对于无向多重图（`MultiGraph`），必须显式使用上三角过滤：
+
+```python
+G = nx.MultiGraph()
+G.add_edge(0, 1, weight=1)  # 添加第一条边，key=0
+G.add_edge(0, 1, weight=1)  # 添加第二条边，key=1
+
+# 结果：两条平行边
+print(G.number_of_edges())  # 2
+```
+
+因此，`from_numpy_array` 必须对无向多重图使用 `u <= v` 过滤，否则对称矩阵会导致每条边被添加两次。
+
+##### 实际行为示例
+
+```python
+import numpy as np
+import networkx as nx
+
+# 对称邻接矩阵
+A = np.array([[0, 1, 0],
+              [1, 0, 2],
+              [0, 2, 0]])
+
+# 普通无向图：遍历整个矩阵，但 add_edges_from 自动去重
+G1 = nx.from_numpy_array(A, create_using=nx.Graph)
+print(G1.edges(data=True))
+# [(0, 1, {'weight': 1}), (1, 2, {'weight': 2})]
+# 注意：weight 可能是 1（A[0,1]）或 1（A[1,0]），取决于遍历顺序
+
+# 无向多重图：只遍历上三角，避免重复
+G2 = nx.from_numpy_array(A, create_using=nx.MultiGraph)
+print(G2.edges(data=True))
+# [(0, 1, {'weight': 1}), (1, 2, {'weight': 2})]
+
+# 有向图：遍历整个矩阵，A[i,j] 和 A[j,i] 是独立的
+G3 = nx.from_numpy_array(A, create_using=nx.DiGraph)
+print(G3.edges(data=True))
+# [(0, 1, {'weight': 1}), (1, 0, {'weight': 1}), (1, 2, {'weight': 2}), (2, 1, {'weight': 2})]
+```
 
 ### 3.4 稀疏矩阵格式转换
 
@@ -779,7 +845,126 @@ def to_scipy_sparse_array(G, nodelist=None, dtype=None, weight="weight", format=
 - **有向图**：每条边只存储一个条目 (i, j)
 - **无向图**：每条边存储两个对称条目 (i, j) 和 (j, i)
 
-### 3.5 转换机制总结
+#### 稀疏数组转图 (`from_scipy_sparse_array`)
+
+从 SciPy 稀疏数组创建图，位于 `networkx/convert_matrix.py:783`。与密集矩阵转图类似，**上三角过滤也只针对无向多重图**。
+
+##### 核心实现逻辑
+
+```python
+def from_scipy_sparse_array(
+    A, parallel_edges=False, create_using=None, edge_attribute="weight"
+):
+    """Creates a new graph from an adjacency matrix given as a SciPy sparse array."""
+    
+    G = nx.empty_graph(0, create_using)
+    n, m = A.shape
+    if n != m:
+        raise nx.NetworkXError(f"Adjacency matrix not square: nx,ny={A.shape}")
+    
+    # 添加节点
+    G.add_nodes_from(range(n))
+    
+    # 从稀疏数组生成 (u, v, weight) 三元组
+    triples = _generate_weighted_edges(A)
+    
+    # 并行边模式（整数数组 + 多重图 + parallel_edges=True）
+    if A.dtype.kind in ("i", "u") and G.is_multigraph() and parallel_edges:
+        chain = itertools.chain.from_iterable
+        # 将权重解释为边的数量，创建多条权重为 1 的边
+        triples = chain(((u, v, 1) for d in range(w)) for (u, v, w) in triples)
+    
+    # ⚠️ 关键：上三角过滤只针对无向多重图
+    if G.is_multigraph() and not G.is_directed():
+        # 无向多重图：只使用上三角（包括对角线）
+        triples = ((u, v, d) for u, v, d in triples if u <= v)
+    
+    G.add_weighted_edges_from(triples, weight=edge_attribute)
+    return G
+```
+
+##### 辅助函数 `_generate_weighted_edges`
+
+```python
+def _generate_weighted_edges(A):
+    """
+    Return an iterable over (u, v, w) triples for each nonzero entry in A.
+    """
+    if A.format == "coo":
+        # COO 格式：直接使用 row, col, data
+        return zip(A.row, A.col, A.data)
+    else:
+        # 其他格式：转换为 COO 后迭代
+        A_coo = A.tocoo()
+        return zip(A_coo.row, A_coo.col, A_coo.data)
+```
+
+##### 与密集矩阵转图的对比
+
+| 特性 | `from_scipy_sparse_array` | `from_numpy_array` |
+|------|---------------------------|---------------------|
+| **数据来源** | 稀疏数组的显式存储条目 | 密集数组的所有非零（或非 nonedge）条目 |
+| **遍历方式** | 迭代存储的三元组 `(row, col, data)` | `np.where()` 找到满足条件的索引 |
+| **上三角过滤条件** | `G.is_multigraph() and not G.is_directed()` | `G.is_multigraph() and not G.is_directed()` |
+| **并行边支持** | 支持（整数类型 + `parallel_edges=True`） | 支持（整数类型 + `parallel_edges=True`） |
+| **节点重映射** | 不支持 | 支持 `nodelist` 参数 |
+| **非边哨兵值** | 不支持（依赖稀疏存储） | 支持 `nonedge` 参数 |
+
+##### 不同图类型的处理差异（与密集矩阵一致）
+
+| 图类型 | 遍历范围 | 去重机制 |
+|--------|----------|----------|
+| **有向图**（`DiGraph`, `MultiDiGraph`） | 所有显式存储的条目 | 无 |
+| **普通无向图**（`Graph`） | 所有显式存储的条目 | `add_weighted_edges_from` 隐式去重 |
+| **无向多重图**（`MultiGraph`） | 上三角条目（`u <= v`） | 显式过滤 |
+
+##### 稀疏矩阵的特殊性
+
+稀疏矩阵的行为取决于它是如何构建的：
+
+```python
+import scipy.sparse as sp
+import networkx as nx
+
+# 情况1：稀疏矩阵只存储上三角（与普通无向图兼容）
+A1 = sp.csr_array([[0, 1, 0],
+                    [0, 0, 2],
+                    [0, 0, 0]])
+G1 = nx.from_scipy_sparse_array(A1, create_using=nx.Graph)
+print(G1.edges(data=True))
+# [(0, 1, {'weight': 1}), (1, 2, {'weight': 2})]
+
+# 情况2：稀疏矩阵存储对称位置（可能导致属性被覆盖）
+A2 = sp.csr_array([[0, 1, 0],
+                    [1, 0, 2],
+                    [0, 2, 0]])
+G2 = nx.from_scipy_sparse_array(A2, create_using=nx.Graph)
+print(G2.edges(data=True))
+# [(0, 1, {'weight': 1}), (1, 2, {'weight': 2})]
+# 注意：虽然 A2[0,1]=1 和 A2[1,0]=1，但 G2[0][1] 只存储一个值
+
+# 情况3：无向多重图 + 对称稀疏矩阵 = 问题！
+A3 = sp.csr_array([[0, 1, 0],
+                    [1, 0, 2],
+                    [0, 2, 0]])
+G3 = nx.from_scipy_sparse_array(A3, create_using=nx.MultiGraph)
+print(G3.edges(data=True))
+# [(0, 1, {'weight': 1}), (1, 2, {'weight': 2})]
+# 由于有 u <= v 过滤，只添加一次，正确！
+
+# 情况4：有向图
+G4 = nx.from_scipy_sparse_array(A2, create_using=nx.DiGraph)
+print(G4.edges(data=True))
+# [(0, 1, {'weight': 1}), (1, 0, {'weight': 1}), (1, 2, {'weight': 2}), (2, 1, {'weight': 2})]
+```
+
+##### 关键洞察
+
+1. **普通无向图的隐式去重是有代价的**：如果稀疏矩阵存储了对称位置的两个条目，`add_edge` 会用后一个值覆盖前一个值。这意味着 `A[i,j]` 和 `A[j,i]` 应该相等，否则结果不确定。
+
+2. **无向多重图必须依赖上三角过滤**：如果没有 `u <= v` 过滤，对称稀疏矩阵会导致每条边被添加两次。
+
+3. **有向图完全依赖稀疏矩阵的存储**：`A[i,j]` 和 `A[j,i]` 是完全独立的两条边。
 
 | 转换方向 | 函数 | 有向图处理 | 无向图处理 |
 |----------|------|-----------|-----------|
@@ -1126,6 +1311,7 @@ print(G2.is_directed())  # False
 
 | 功能 | 文件路径 | 关键行号 |
 |------|----------|----------|
+| `@nodes_or_number` 装饰器 | `networkx/utils/decorators.py` | 199 |
 | `empty_graph` | `networkx/generators/classic.py` | 586 |
 | `check_create_using` | `networkx/utils/misc.py` | 667 |
 | `complete_graph` | `networkx/generators/classic.py` | 316 |
@@ -1139,7 +1325,10 @@ print(G2.is_directed())  # False
 | `to_dict_of_dicts` | `networkx/convert.py` | 253 |
 | `from_dict_of_dicts` | `networkx/convert.py` | 374 |
 | `to_numpy_array` | `networkx/convert_matrix.py` | 893 |
+| `from_numpy_array` | `networkx/convert_matrix.py` | 1132 |
 | `to_scipy_sparse_array` | `networkx/convert_matrix.py` | 496 |
+| `from_scipy_sparse_array` | `networkx/convert_matrix.py` | 783 |
+| `_generate_weighted_edges` | `networkx/convert_matrix.py` | （辅助函数） |
 | `write_graphml` | `networkx/readwrite/graphml.py` | 62 |
 | `read_graphml` | `networkx/readwrite/graphml.py` | （见 `GraphMLReader` 类） |
 
