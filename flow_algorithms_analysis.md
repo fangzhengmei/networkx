@@ -1413,6 +1413,903 @@ def minimum_node_cut(G, s=None, t=None, flow_func=None):
 
 ---
 
+## 10. 当前边游标机制（CurrentEdge）
+
+### 10.1 问题背景：邻接表重复扫描的开销
+
+在最高标签预流推进算法中，核心操作是**discharge**（释放）：对一个有超额流的活跃节点，扫描其所有出边，尝试将超额流推送到邻居节点。
+
+**朴素实现的问题**：
+```python
+# 朴素实现（不使用 CurrentEdge）
+def discharge_naive(u):
+    while excess[u] > 0:
+        for v in R_succ[u]:  # 每次都从头扫描所有边！
+            if height[u] == height[v] + 1 and residual(u, v) > 0:
+                push(u, v, min(excess[u], residual(u, v)))
+                if excess[u] == 0:
+                    break
+        # 如果没有可用边，需要重标记
+        height[u] = relabel(u)
+```
+
+**问题**：
+1. 每次 `discharge` 都从邻接表的**第一个元素**开始扫描
+2. 如果前几条边已饱和或高度不满足条件，每次都要重新检查
+3. 最坏情况下，每条边可能被检查 $O(n)$ 次，导致 $O(n m)$ 的邻接表扫描开销
+
+### 10.2 CurrentEdge 数据结构设计
+
+**核心实现**（`utils.py:19-48`）：
+
+```python
+class CurrentEdge:
+    """Mechanism for iterating over out-edges incident to a node in a circular
+    manner. StopIteration exception is raised when wraparound occurs.
+    """
+
+    __slots__ = ("_edges", "_it", "_curr")
+
+    def __init__(self, edges):
+        self._edges = edges
+        if self._edges:
+            self._rewind()
+
+    def get(self):
+        return self._curr
+
+    def move_to_next(self):
+        try:
+            self._curr = next(self._it)
+        except StopIteration:
+            self._rewind()
+            raise
+
+    def _rewind(self):
+        self._it = iter(self._edges.items())
+        self._curr = next(self._it)
+
+    def __eq__(self, other):
+        return (getattr(self, "_curr", None), self._edges) == (
+            (getattr(other, "_curr", None), other._edges)
+        )
+```
+
+**数据结构解析**：
+
+| 属性 | 类型 | 作用 |
+|------|------|------|
+| `_edges` | dict | 节点的出边邻接表（`R_succ[u]`） |
+| `_it` | iterator | 当前迭代器位置 |
+| `_curr` | tuple | 当前边 `(v, attr)` |
+
+**设计特点**：
+1. **游标持久化**：游标位置在多次 `discharge` 调用之间保持
+2. **循环遍历**：到达末尾时抛出 `StopIteration`，可通过 `_rewind()` 重置
+3. **内存优化**：使用 `__slots__` 减少内存开销
+
+### 10.3 在 Discharge 中的使用方式
+
+**初始化**（`preflowpush.py:86-88`）：
+```python
+# 为每个节点创建 CurrentEdge 游标
+for u in R:
+    R_nodes[u]["height"] = heights[u] if u in heights else n + 1
+    R_nodes[u]["curr_edge"] = CurrentEdge(R_succ[u])  # 游标初始化
+```
+
+**Discharge 中的使用**（`preflowpush.py:134-173`）：
+
+```python
+def discharge(u, is_phase1):
+    """Discharge a node until it becomes inactive or, during phase 1 (see
+    below), its height reaches at least n. The node is known to have the
+    largest height among active nodes.
+    """
+    height = R_nodes[u]["height"]
+    curr_edge = R_nodes[u]["curr_edge"]  # 获取持久化游标
+    next_height = height
+    levels[height].active.remove(u)
+    
+    while True:
+        # 使用游标获取当前边（不是从头开始！）
+        v, attr = curr_edge.get()
+        
+        if height == R_nodes[v]["height"] + 1 and attr["flow"] < attr["capacity"]:
+            # 发现许可边，尝试推流
+            flow = min(R_nodes[u]["excess"], attr["capacity"] - attr["flow"])
+            push(u, v, flow)
+            activate(v)
+            if R_nodes[u]["excess"] == 0:
+                # 超额流已推送完毕，节点变为非活跃
+                levels[height].inactive.add(u)
+                break  # 游标位置保留，下次从这里继续
+        
+        # 移动到下一条边
+        try:
+            curr_edge.move_to_next()
+        except StopIteration:
+            # 遍历完所有边，没有找到许可边
+            # 需要重标记来创建新的许可边
+            height = relabel(u)  # 重标记会增加高度
+            
+            if is_phase1 and height >= n - 1:
+                # 第一阶段特殊处理：高度 >= n-1 的节点在 S 侧
+                levels[height].active.add(u)
+                break
+            
+            next_height = height
+    
+    R_nodes[u]["height"] = height
+    return next_height
+```
+
+### 10.4 游标前进与重置的触发条件
+
+**前进时机**：
+```python
+# 当当前边不满足条件时（高度不匹配 或 已饱和）
+if not (height == R_nodes[v]["height"] + 1 and attr["flow"] < attr["capacity"]):
+    curr_edge.move_to_next()  # 前进到下一条边
+```
+
+**重置时机**：
+```python
+# 当遍历完所有边仍未找到许可边时
+try:
+    curr_edge.move_to_next()
+except StopIteration:
+    # 游标到达末尾，需要重标记
+    height = relabel(u)
+    # 注意：重标记后游标位置保留，下次从当前位置继续
+```
+
+**关键洞察**：
+- **重标记后不重置游标**！这是因为重标记增加了节点高度，原来的边可能现在变成许可边
+- 只有 `_rewind()` 会重置游标，但这个方法主要在初始化时使用
+
+### 10.5 效率提升分析
+
+**朴素实现**：
+```
+discharge(u):
+    从头扫描所有边:
+        边1: 饱和 → 跳过
+        边2: 高度不匹配 → 跳过
+        边3: 许可边 → 推送流量
+    下次 discharge(u):
+        从头扫描所有边:
+            边1: 仍饱和 → 跳过
+            边2: 高度仍不匹配 → 跳过
+            边3: 可能仍有残余容量 → 继续推送
+```
+
+**CurrentEdge 优化**：
+```
+discharge(u):
+    从游标位置开始:
+        边1: 饱和 → 前进
+        边2: 高度不匹配 → 前进
+        边3: 许可边 → 推送流量
+    游标停在边4的位置
+    下次 discharge(u):
+        从边4开始:
+            边4: ...
+```
+
+**时间复杂度改进**：
+- **朴素实现**：每条边可能被检查 $O(n)$ 次，总邻接表扫描 $O(n m)$
+- **CurrentEdge 优化**：每条边最多被检查 $O(1)$ 次（除非节点被重标记）
+- 重标记次数为 $O(n^2)$（最高标签预流推进），但邻接表扫描开销显著降低
+
+### 10.6 与 Dinitz 指针优化的对比
+
+| 特性 | Preflow-Push CurrentEdge | Dinitz 指针优化 |
+|------|--------------------------|-----------------|
+| **数据结构** | 独立 `CurrentEdge` 类 | `parents` 列表 |
+| **持久化** | 跨 discharge 调用保持 | 每次 BFS 后重建 |
+| **遍历方向** | 正向遍历出边 | 反向从汇点到源点 |
+| **重置时机** | 几乎不重置（除非重标记） | 每次 BFS 后完全重置 |
+| **适用场景** | 活跃节点频繁 discharge | 分层图阻塞流搜索 |
+
+**本质差异**：
+- **CurrentEdge**：为单个节点的多次 discharge 优化，游标在活跃节点生命周期内保持
+- **Dinitz 指针**：为单次阻塞流搜索优化，在分层图生命周期内有效
+
+---
+
+## 11. 全局重标记启发式
+
+### 11.1 问题背景：高度标签的保守性
+
+在预流推进算法中，节点的**高度标签**（height label）决定了推流的方向：
+- 只有当 `height[u] == height[v] + 1` 时，才能从 `u` 推流到 `v`
+- 当节点无法推流时，需要**重标记**（relabel）来增加高度
+
+**朴素重标记的问题**：
+```python
+def relabel_naive(u):
+    """朴素重标记：取所有邻居高度的最小值 + 1"""
+    min_height = INF
+    for v, attr in R_succ[u].items():
+        if attr["flow"] < attr["capacity"]:  # 边有残余容量
+            min_height = min(min_height, R_nodes[v]["height"])
+    return min_height + 1
+```
+
+**问题**：
+1. **保守上界**：朴素重标记得到的高度是**保守上界**，不是精确距离
+2. **漂移问题**：随着算法进行，高度标签可能与实际最短路径距离偏差越来越大
+3. **效率下降**：高度不准确会导致更多无效的推流尝试
+
+### 11.2 GlobalRelabelThreshold 触发机制
+
+**阈值计算**（`utils.py:61-77`）：
+
+```python
+class GlobalRelabelThreshold:
+    """Measurement of work before the global relabeling heuristic should be
+    applied.
+    """
+
+    def __init__(self, n, m, freq):
+        # 阈值 = (节点数 + 边数) / 频率
+        self._threshold = (n + m) / freq if freq else float("inf")
+        self._work = 0  # 累计工作量
+
+    def add_work(self, work):
+        self._work += work
+
+    def is_reached(self):
+        return self._work >= self._threshold
+
+    def clear_work(self):
+        self._work = 0
+```
+
+**参数解析**：
+
+| 参数 | 默认值 | 作用 |
+|------|--------|------|
+| `n` | 图节点数 | 基数计算 |
+| `m` | 图边数 | 基数计算 |
+| `freq` | `1`（`preflow_push` 默认） | 频率因子 |
+
+**阈值公式**：
+$$\text{threshold} = \frac{n + m}{\text{freq}}$$
+
+当 `freq=1` 时：
+- 累计工作量达到 $n + m$ 时触发全局重标记
+- 这意味着每处理约一条边/一个节点后进行一次全局重标记
+
+### 11.3 工作量的累积方式
+
+**在哪里累积？**（`preflowpush.py:122-132`）：
+
+```python
+def relabel(u):
+    """Relabel a node to create an admissible edge."""
+    # 每次重标记扫描节点的所有出边，工作量 += 出边数
+    grt.add_work(len(R_succ[u]))
+    return (
+        min(
+            R_nodes[v]["height"]
+            for v, attr in R_succ[u].items()
+            if attr["flow"] < attr["capacity"]
+        )
+        + 1
+    )
+```
+
+**工作量定义**：
+- 每次 `relabel(u)` 扫描 `u` 的所有出边
+- 工作量 = 扫描的边数
+- 这是一种**近似度量**，不精确但实用
+
+**触发时机**（`preflowpush.py:238-243`）：
+
+```python
+while height > 0:
+    while True:
+        # ... discharge 操作 ...
+        height = discharge(u, True)
+        
+        if grt.is_reached():
+            # 阈值已达，执行全局重标记
+            height = global_relabel(True)  # from_sink=True
+            max_height = height
+            grt.clear_work()  # 重置工作量计数
+```
+
+### 11.4 精确高度计算：反向 BFS
+
+**核心函数**（`preflowpush.py:53-66`）：
+
+```python
+def reverse_bfs(src):
+    """Perform a reverse breadth-first search from src in the residual
+    network.
+    """
+    heights = {src: 0}  # 源点高度为 0
+    q = deque([(src, 0)])
+    while q:
+        u, height = q.popleft()
+        height += 1
+        # 反向遍历：从 v 到 u 的反向边有残余容量
+        # 等价于 u 到 v 的正向边有残余容量
+        for v, attr in R_pred[u].items():
+            if v not in heights and attr["flow"] < attr["capacity"]:
+                heights[v] = height
+                q.append((v, height))
+    return heights
+```
+
+**为什么是反向 BFS？**
+
+在残差网络中：
+- 我们想知道**从各节点到汇点的最短距离**（边数）
+- 正向 BFS 从汇点出发无法遍历所有节点（可能没有正向路径）
+- 反向 BFS 从汇点出发，遍历所有有路径到达汇点的节点
+
+**高度的含义**：
+
+| 方向 | BFS 起点 | 高度含义 |
+|------|---------|---------|
+| **反向 BFS 从 t** | 汇点 | `height[v]` = 从 v 到 t 的最短路径边数 |
+| **反向 BFS 从 s** | 源点 | `height[v]` = 从 s 到 v 的最短路径边数 |
+
+### 11.5 全局重标记的完整实现
+
+**`global_relabel` 函数**（`preflowpush.py:188-218`）：
+
+```python
+def global_relabel(from_sink):
+    """Apply the global relabeling heuristic."""
+    # 选择 BFS 起点
+    src = t if from_sink else s
+    
+    # 执行反向 BFS 计算精确高度
+    heights = reverse_bfs(src)
+    
+    if not from_sink:
+        # 从源点出发的情况：需要调整高度偏移
+        # 因为源点 s 的高度应为 n（不是 0）
+        del heights[t]  # 移除汇点
+        max_height = max(heights.values())
+    else:
+        # 从汇点出发的情况
+        max_height = max(heights.values())
+        
+        # 标记无法到达汇点的节点（高度设为 n+1）
+        for u in R:
+            if u not in heights and R_nodes[u]["height"] < n:
+                heights[u] = n + 1
+    
+    if not from_sink:
+        # 从源点出发：高度需要偏移 n
+        # 这样 s 的高度 = 0 + n = n，与初始化一致
+        for u in heights:
+            heights[u] += n
+        max_height += n
+    
+    del heights[src]  # 移除起点本身
+    
+    # 更新所有节点的高度和层级
+    for u, new_height in heights.items():
+        old_height = R_nodes[u]["height"]
+        if new_height != old_height:
+            # 从旧层级移除
+            if u in levels[old_height].active:
+                levels[old_height].active.remove(u)
+                levels[new_height].active.add(u)
+            else:
+                levels[old_height].inactive.remove(u)
+                levels[new_height].inactive.add(u)
+            # 更新高度
+            R_nodes[u]["height"] = new_height
+    
+    return max_height
+```
+
+### 11.6 两种搜索方向的差异
+
+**Phase 1：从汇点重标记（`from_sink=True`）**
+
+```python
+# 第一阶段目标：推送尽可能多的流量到汇点
+# 关心的是：节点到汇点的距离
+height = global_relabel(True)  # 从汇点反向 BFS
+```
+
+**高度含义**：
+- `height[v]` = 从 v 到 t 的最短路径边数
+- 无法到达 t 的节点：`height = n + 1`（特殊标记）
+
+**Phase 2：从源点重标记（`from_sink=False`）**
+
+```python
+# 第二阶段目标：将超额流推送回源点
+# 关心的是：源点到各节点的距离（反向意义上）
+height = global_relabel(False)  # 从源点反向 BFS
+```
+
+**高度含义**：
+- 基础值 = 从 s 到 v 的最短路径边数
+- 偏移后 = 基础值 + $n$
+- 这样 s 的高度 = $0 + n = n$，与初始化一致
+
+### 11.7 精确高度 vs 保守高度
+
+**对比表**：
+
+| 特性 | 精确高度（全局重标记） | 保守高度（朴素重标记） |
+|------|----------------------|---------------------|
+| **计算方式** | 反向 BFS 遍历整个残差网络 | 扫描单个节点的出边 |
+| **高度性质** | 到源/汇的精确最短距离 | 邻居最小高度 + 1（保守上界） |
+| **更新频率** | 每 $n+m$ 工作量触发一次 | 节点无法推流时触发 |
+| **准确性** | 100% 准确 | 可能比实际距离大很多 |
+| **计算开销** | $O(n + m)$ 每次 | $O(\text{出边数})$ 每次 |
+| **对算法的影响** | 减少无效推流尝试 | 可能导致高度"漂移" |
+
+**为什么精确高度更好？**
+
+```
+假设实际距离：
+s ---a--- b --- t   (s到t距离=3)
+
+朴素重标记可能得到：
+s(height=5) → a(height=4) → b(height=2) → t(height=0)
+
+问题：s 到 a 的高度差 = 1（正确），但 a 到 b 的高度差 = 2（错误）
+     这会导致 a 无法推流到 b，需要额外的重标记
+
+全局重标记得到：
+s(height=3) → a(height=2) → b(height=1) → t(height=0)
+
+所有许可边都是正确的最短路径边
+```
+
+### 11.8 全局重标记与间隙启发式的关系
+
+**相似之处**：
+- 都用于修正高度标签
+- 都能提前识别最小割
+
+**不同之处**：
+
+| 特性 | 全局重标记 | 间隙启发式 |
+|------|-----------|-----------|
+| **触发条件** | 工作量阈值 | 某层节点数变为 0 |
+| **操作范围** | 所有节点 | 间隙以上的所有节点 |
+| **高度更新** | 设为精确距离 | 设为 $n+1$（特殊标记） |
+| **目的** | 提高推流效率 | 提前终止第一阶段 |
+
+**互补关系**：
+- 全局重标记**主动**修正高度，提高效率
+- 间隙启发式**被动**检测异常，提前终止
+- 两者结合使用效果最佳
+
+---
+
+## 12. 间隙启发式与两阶段终止
+
+### 12.1 预流推进的两阶段设计
+
+**整体架构**（`preflowpush.py:220-288`）：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    预流推进算法主流程                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  初始化：                                                      │
+│    - 从源点饱和推送所有出边                                    │
+│    - 源点邻居获得超额流，成为活跃节点                          │
+│    - 源点高度设为 n，汇点高度设为 0                            │
+│                                                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Phase 1：第一阶段（求最大预流）                               │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  while 存在高度 > 0 的活跃节点:                       │    │
+│  │      选择最高层的活跃节点 u                            │    │
+│  │      discharge(u):                                    │    │
+│  │          - 尝试向低层邻居推流                          │    │
+│  │          - 无法推流则重标记（增加高度）                 │    │
+│  │          - 高度 >= n-1 时停止（在 S 侧）              │    │
+│  │                                                        │    │
+│  │      检查：                                            │    │
+│  │      - 全局重标记阈值？→ 执行全局重标记               │    │
+│  │      - 出现间隙？→ 应用间隙启发式，提前终止           │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                               │
+│  第一阶段结束条件：                                             │
+│    1. 无活跃节点（所有超额流已到达汇点或被"困"在 S 侧）       │
+│    2. 间隙启发式触发（最小割已识别）                           │
+│                                                               │
+│  第一阶段结果：                                                 │
+│    - R_nodes[t]["excess"] = 最大流值（已正确）               │
+│    - 如果 value_only=True，可直接返回                         │
+│    - 但流不是合法流（某些节点仍有超额流）                      │
+│                                                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Phase 2：第二阶段（预流转最大流）                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  前置操作：                                            │    │
+│  │      global_relabel(False) → 从源点重标记           │    │
+│  │      这样节点高度 = 到源点的距离 + n                  │    │
+│  │      高度 > n 的节点在 S 侧，有超额流需要推送回源点    │    │
+│  │                                                        │    │
+│  │  while 存在高度 > n 的活跃节点:                       │    │
+│  │      选择最高层的活跃节点 u                            │    │
+│  │      discharge(u, is_phase1=False):                   │    │
+│  │          - 无高度上限限制（可超过 2n）                │    │
+│  │          - 持续推流直到超额流为 0                     │    │
+│  │                                                        │    │
+│  │      检查：                                            │    │
+│  │      - 全局重标记阈值？→ 执行全局重标记               │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                               │
+│  第二阶段结束条件：                                             │
+│    - 无活跃节点（所有超额流已处理）                            │
+│    - 源点和汇点可以有超额流（不违反流守恒）                     │
+│                                                               │
+│  第二阶段结果：                                                 │
+│    - 合法最大流：所有中间节点流入 = 流出                       │
+│    - 残差图可用于最小割提取                                     │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 Level 数据结构设计
+
+**实现**（`utils.py:51-58`）：
+
+```python
+class Level:
+    """Active and inactive nodes in a level."""
+
+    __slots__ = ("active", "inactive")
+
+    def __init__(self):
+        self.active = set()    # 活跃节点：有超额流需要推送
+        self.inactive = set()  # 非活跃节点：无超额流
+```
+
+**初始化**（`preflowpush.py:104-112`）：
+
+```python
+# 创建 2n 个层级（高度范围 0 到 2n-1）
+levels = [Level() for i in range(2 * n)]
+
+# 将节点分配到对应层级
+for u in R:
+    if u != s and u != t:  # 源点和汇点不参与层级管理
+        level = levels[R_nodes[u]["height"]]
+        if R_nodes[u]["excess"] > 0:
+            level.active.add(u)   # 有超额流 → 活跃
+        else:
+            level.inactive.add(u) # 无超额流 → 非活跃
+```
+
+**激活函数**（`preflowpush.py:114-120`）：
+
+```python
+def activate(v):
+    """Move a node from the inactive set to the active set of its level."""
+    if v != s and v != t:
+        level = levels[R_nodes[v]["height"]]
+        if v in level.inactive:
+            level.inactive.remove(v)
+            level.active.add(v)  # 成为活跃节点
+```
+
+**为什么需要分层？**
+
+最高标签预流推进（Highest-Label Preflow-Push）的核心优化：
+- **总是选择最高层的活跃节点进行 discharge**
+- 这样可以最小化重标记次数
+- 分层数据结构使得选择最高层节点成为 $O(1)$ 操作
+
+### 12.3 间隙启发式的触发条件
+
+**主循环中的检测**（`preflowpush.py:244-251`）：
+
+```python
+while height > 0:
+    while True:
+        # ... discharge 操作 ...
+        height = discharge(u, True)
+        
+        if grt.is_reached():
+            # 全局重标记
+            height = global_relabel(True)
+            max_height = height
+            grt.clear_work()
+        
+        elif not old_level.active and not old_level.inactive:
+            # 间隙启发式：old_height 层已空！
+            gap_heuristic(old_height)
+            height = old_height - 1
+            max_height = height
+        
+        else:
+            max_height = max(max_height, height)
+```
+
+**触发条件解析**：
+
+```python
+not old_level.active and not old_level.inactive
+# 等价于
+old_level.active == set() and old_level.inactive == set()
+```
+
+这意味着：
+- `old_height` 层的活跃节点集合为空
+- `old_height` 层的非活跃节点集合也为空
+- **该层完全没有节点了！**
+
+### 12.4 间隙启发式的实现
+
+**核心函数**（`preflowpush.py:175-186`）：
+
+```python
+def gap_heuristic(height):
+    """Apply the gap heuristic."""
+    # 移动所有高度 > height 的节点到高度 n+1
+    # 范围：height+1 到 max_height
+    for level in islice(levels, height + 1, max_height + 1):
+        # 处理活跃节点
+        for u in level.active:
+            R_nodes[u]["height"] = n + 1
+        # 处理非活跃节点
+        for u in level.inactive:
+            R_nodes[u]["height"] = n + 1
+        
+        # 移动到 n+1 层
+        levels[n + 1].active.update(level.active)
+        level.active.clear()
+        levels[n + 1].inactive.update(level.inactive)
+        level.inactive.clear()
+```
+
+### 12.5 间隙启发式的正确性证明
+
+**为什么间隙意味着最小割？**
+
+**高度标签的性质**：
+- 初始化时：`height[t] = 0`，`height[s] = n`
+- 对于任何许可边 $u \to v$（有残余容量且 `height[u] == height[v] + 1`）：
+  - 如果 `height[u] < n$，则 $u$ 可能在 $S$ 侧或 $T$ 侧
+  - 如果 `height[u] >= n$，则 $u$ 在 $S$ 侧（无法通过最短路径到达汇点）
+
+**间隙的含义**：
+```
+高度分布（示例）：
+
+height=5:  [节点A, 节点B]  ← 活跃
+height=4:  []  ← 空！这就是间隙
+height=3:  [节点C]
+height=2:  [节点D]
+height=1:  [节点E]
+height=0:  [t]
+```
+
+如果高度 `h` 层没有节点：
+- 所有高度 `> h` 的节点无法到达高度 `< h` 的节点
+- 因为任何路径都需要经过高度递减的许可边
+- 但高度 `h` 层为空，无法"跳跃"
+
+**最小割分区**：
+- $S$ = 高度 `> h` 的所有节点（包括源点）
+- $T$ = 高度 `<= h` 的所有节点（包括汇点）
+- 任何从 $S$ 到 $T$ 的边都已饱和（否则许可边会连接两层）
+
+**特殊高度 `n+1`**：
+```python
+# 间隙启发式将间隙以上的节点设为 n+1
+R_nodes[u]["height"] = n + 1
+```
+
+这是一个**特殊标记**：
+- 表示该节点在 $S$ 侧
+- 在第一阶段不再处理（因为 `is_phase1 and height >= n - 1` 时停止）
+- 其超额流将在第二阶段被推送回源点
+
+### 12.6 第一阶段的终止条件
+
+**主循环**（`preflowpush.py:223-256`）：
+
+```python
+# Phase 1: 推送尽可能多的流量到汇点
+height = max_height
+while height > 0:
+    while True:
+        level = levels[height]
+        if not level.active:
+            # 当前层无活跃节点，下降一层
+            height -= 1
+            break
+        
+        # 记录旧层用于间隙检测
+        old_height = height
+        old_level = level
+        
+        # 选择一个活跃节点进行 discharge
+        u = arbitrary_element(level.active)
+        height = discharge(u, True)  # is_phase1=True
+        
+        # 检查启发式
+        if grt.is_reached():
+            height = global_relabel(True)
+            max_height = height
+            grt.clear_work()
+        
+        elif not old_level.active and not old_level.inactive:
+            # 间隙出现！
+            gap_heuristic(old_height)
+            height = old_height - 1
+            max_height = height
+        
+        else:
+            max_height = max(max_height, height)
+```
+
+**终止条件详解**：
+
+| 条件 | 含义 | 处理 |
+|------|------|------|
+| `height > 0` | 仍有节点在 1..max_height 层 | 继续循环 |
+| `level.active` 为空 | 当前层无活跃节点 | 下降一层 `height -= 1` |
+| 间隙出现 | 某层完全为空 | 应用间隙启发式，下降到 `old_height - 1` |
+| `discharge` 返回 `height >= n-1` | 节点在 S 侧，第一阶段不处理 | 移到高层，继续处理其他节点 |
+
+**第一阶段结束的含义**：
+- 所有活跃节点要么在汇点（超额流已接收），要么在高度 `>= n` 层（在 S 侧）
+- 最小割已隐式确定：$S$ = 高度 `>= n` 的节点，$T$ = 高度 `< n` 的节点
+
+### 12.7 第二阶段：超额流的回收
+
+**为什么需要第二阶段？**
+
+第一阶段结束时：
+- 汇点的超额流 = 最大流值（正确）
+- 但某些中间节点可能仍有超额流（违反流守恒）
+- 这些节点在 $S$ 侧，无法到达汇点
+
+**第二阶段目标**：
+- 将 $S$ 侧节点的超额流推送回源点
+- 使所有中间节点满足流入 = 流出
+
+**第二阶段实现**（`preflowpush.py:263-287`）：
+
+```python
+# Phase 2: 将最大预流转换为最大流
+# 通过将超额流推送回源点
+
+# 前置操作：从源点进行全局重标记
+height = global_relabel(False)  # from_sink=False
+grt.clear_work()
+
+# 第二阶段循环：处理高度 > n 的节点（在 S 侧）
+while height > n:
+    while True:
+        level = levels[height]
+        if not level.active:
+            # 当前层无活跃节点，下降一层
+            height -= 1
+            break
+        
+        # 选择活跃节点 discharge
+        u = arbitrary_element(level.active)
+        height = discharge(u, False)  # is_phase1=False
+        
+        if grt.is_reached():
+            # 全局重标记
+            height = global_relabel(False)
+            grt.clear_work()
+
+# 第二阶段结束
+R.graph["flow_value"] = R_nodes[t]["excess"]
+return R
+```
+
+**关键差异：`is_phase1=False`**
+
+在 `discharge` 函数中（`preflowpush.py:161-166`）：
+
+```python
+if is_phase1 and height >= n - 1:
+    # 第一阶段：高度 >= n-1 的节点停止处理
+    # 因为它们在 S 侧，无法到达汇点
+    levels[height].active.add(u)
+    break
+# 第二阶段：无此检查，继续推流直到超额流为 0
+```
+
+**第二阶段的推流方向**：
+
+第一阶段：
+- 目标：推送流量到汇点
+- 许可边：`height[u] == height[v] + 1`（向低层推流）
+- 低层 = 更接近汇点
+
+第二阶段（从源点重标记后）：
+- 高度 = 到源点的距离 + $n$
+- 低层 = 更接近源点
+- 向低层推流 = 推送回源点
+
+**示例**：
+```
+从源点重标记后：
+s: height = 0 + n = n
+a: height = 1 + n = n+1  (距离 s 为 1)
+b: height = 2 + n = n+2  (距离 s 为 2)
+
+许可边 s <- a <- b（向低层推流 = 向源点推流）
+```
+
+### 12.8 value_only 参数的优化
+
+**参数定义**（`preflowpush.py:294-346`）：
+
+```python
+def preflow_push(
+    G, s, t, capacity="capacity", residual=None, 
+    global_relabel_freq=1, value_only=False
+):
+    """
+    value_only : bool
+        If False, compute a maximum flow; 
+        otherwise, compute a maximum preflow which is enough for 
+        computing the maximum flow value. Default value: False.
+    """
+```
+
+**优化点**（`preflowpush.py:257-261`）：
+
+```python
+# 第一阶段结束
+# R_nodes[t]["excess"] 已是最大流值
+if value_only:
+    R.graph["flow_value"] = R_nodes[t]["excess"]
+    return R  # 直接返回，跳过第二阶段！
+```
+
+**为什么这是正确的？**
+
+最大流-最小割定理：
+- 最大流值 = 最小割容量
+- 第一阶段结束时，最小割已确定
+- 汇点的超额流 = 已推送的总流量 = 最大流值
+- 第二阶段只是将"被困"在 S 侧的流量推送回源点，不改变汇点的超额流
+
+**适用场景**：
+- 只需要最大流值（不需要完整流分配）
+- 只需要最小割分区（可从残差图提取）
+- `minimum_cut` 函数调用时设置 `value_only=True`
+
+### 12.9 两阶段设计的性能收益
+
+| 阶段 | 目标 | 终止条件 | 性能优化 |
+|------|------|---------|---------|
+| **Phase 1** | 求最大预流 | 无活跃节点 或 间隙出现 | 间隙启发式提前终止，`value_only` 可跳过 Phase 2 |
+| **Phase 2** | 预流转合法流 | 无活跃节点 | 只处理 S 侧节点，工作量减少 |
+
+**间隙启发式的收益**：
+- 可能在算法早期就识别最小割
+- 避免不必要的推流和重标记操作
+- 对于某些图结构（如网格图），间隙可能很早就出现
+
+**value_only 的收益**：
+- 完全跳过第二阶段
+- 对于最小割计算，这是巨大的优化
+- 因为 `minimum_cut` 只需要流值和残差图结构
+
+---
+
 ## 6. 架构设计总结
 
 ### 6.1 层次化架构
