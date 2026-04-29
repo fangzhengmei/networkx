@@ -11,7 +11,96 @@ NetworkX 的图生成器采用了**工厂方法模式**与**策略模式**相结
 
 ### 1.2 统一接口机制
 
-所有图生成器函数都遵循相同的接口模式，核心是 `create_using` 参数和 `empty_graph` 基础函数。
+所有图生成器函数都遵循相同的接口模式，核心是 `create_using` 参数、`empty_graph` 基础函数，以及 `@nodes_or_number` 装饰器。
+
+#### `@nodes_or_number` 装饰器：参数统一转换机制
+
+**所有图生成器支持整数和节点容器双输入的关键在于 `@nodes_or_number` 装饰器**。这个装饰器位于 `networkx/utils/decorators.py:199`，是生成器统一接口的核心组件。
+
+##### 装饰器实现
+
+```python
+def nodes_or_number(which_args):
+    """Decorator to allow number of nodes or container of nodes.
+    
+    With this decorator, the specified argument can be either a number or a container
+    of nodes. If it is a number, the nodes used are `range(n)`.
+    This allows `nx.complete_graph(50)` in place of `nx.complete_graph(list(range(50)))`.
+    And it also allows `nx.complete_graph(any_list_of_nodes)`.
+    """
+    
+    def _nodes_or_number(n):
+        try:
+            nodes = list(range(n))
+        except TypeError:
+            nodes = tuple(n)
+        else:
+            if n < 0:
+                raise nx.NetworkXError(f"Negative number of nodes not valid: {n}")
+        return (n, nodes)  # 返回元组：(原始值, 节点列表)
+    
+    try:
+        iter_wa = iter(which_args)
+    except TypeError:
+        iter_wa = (which_args,)
+    
+    return argmap(_nodes_or_number, *iter_wa)
+```
+
+##### 工作原理
+
+| 输入类型 | 转换结果 | 示例 |
+|----------|----------|------|
+| **整数 `n`** | `(n, list(range(n)))` | `5` → `(5, [0, 1, 2, 3, 4])` |
+| **节点容器** | `(container, tuple(container))` | `["A", "B"]` → `(["A", "B"], ("A", "B"))` |
+
+##### 在生成器中的使用
+
+装饰器将参数转换为 `(original_value, nodes_list)` 元组，因此生成器函数中可以使用解包语法：
+
+```python
+@nx._dispatchable(graphs=None, returns_graph=True)
+@nodes_or_number([0, 1])  # 转换第0和第1个参数
+def grid_2d_graph(m, n, periodic=False, create_using=None):
+    # m 和 n 已被转换为元组
+    row_name, rows = m  # 解包：row_name = 原始值, rows = 节点列表
+    col_name, cols = n
+    # ...
+```
+
+对于 `empty_graph` 中的 `_, nodes = n`：
+
+```python
+@nodes_or_number(0)  # 转换第0个参数
+def empty_graph(n=0, create_using=None, default=Graph):
+    _, nodes = n  # 忽略原始值，只使用节点列表
+    G.add_nodes_from(nodes)
+    return G
+```
+
+##### 支持多参数转换
+
+`@nodes_or_number` 支持同时转换多个参数，这在网格图等需要多个维度参数的生成器中非常有用：
+
+```python
+# 转换多个参数
+@nodes_or_number(["m1", "m2"])  # 按名称
+def grid_2d_graph(m1, m2, periodic=False):
+    pass
+
+@nodes_or_number([0, 1])  # 按索引
+def grid_2d_graph(m1, m2, periodic=False):
+    pass
+
+# 转换单个参数
+@nodes_or_number("nodes")  # 按名称
+def empty_graph(nodes):
+    pass
+
+@nodes_or_number(0)  # 按索引
+def empty_graph(nodes):
+    pass
+```
 
 #### `create_using` 参数设计
 
@@ -39,7 +128,7 @@ def empty_graph(n=0, create_using=None, default=Graph):
         create_using.clear()
         G = create_using
     
-    _, nodes = n
+    _, nodes = n  # 解包 @nodes_or_number 装饰器转换的元组
     G.add_nodes_from(nodes)
     return G
 ```
