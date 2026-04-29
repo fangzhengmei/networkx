@@ -639,8 +639,15 @@ NetworkX 的中心性算法接口设计遵循以下原则：
 
 2. **PageRank 的多版本策略**：
    - 默认使用 SciPy 稀疏矩阵版本（性能最优）
-   - 保留 NumPy 和纯 Python 版本作为兼容性保障
-   - 设计模式：策略模式 + 优雅降级
+   - 保留 NumPy 和纯 Python 版本作为独立的可调用工具
+   - **注意**：当前实现**不存在自动回退/降级机制**：
+     - 公开入口 `pagerank()` 直接硬编码调用 `_pagerank_scipy()` (pagerank_alg.py:110-112)
+     - 如果 SciPy 不可用，会直接抛出 `ImportError`，而非自动回退到 `_pagerank_numpy` 或 `_pagerank_python`
+     - `_pagerank_numpy` 和 `_pagerank_python` 是内部函数，用户需显式导入调用
+   - 三套实现的定位：
+     - `_pagerank_scipy`：生产环境首选，性能最优
+     - `_pagerank_numpy`：小规模图精确求解，需理解稠密矩阵特性
+     - `_pagerank_python`：无依赖环境备用，或用于学习理解算法
 
 3. **特征向量 vs Katz 的关系**：
    - Katz 中心性是特征向量中心性的推广
