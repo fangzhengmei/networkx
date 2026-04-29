@@ -1553,20 +1553,65 @@ if not (height == R_nodes[v]["height"] + 1 and attr["flow"] < attr["capacity"]):
     curr_edge.move_to_next()  # 前进到下一条边
 ```
 
-**重置时机**：
+**重置与重标记的联动**：
+
+**`move_to_next()` 的内部执行顺序**（`utils.py:34-39`）：
 ```python
-# 当遍历完所有边仍未找到许可边时
+def move_to_next(self):
+    try:
+        self._curr = next(self._it)
+    except StopIteration:
+        # 注意执行顺序：
+        # 1. 先调用 _rewind() 回绕到首边
+        # 2. 再抛出 StopIteration 传播给 discharge
+        self._rewind()
+        raise
+```
+
+这意味着：
+- **游标重置和重标记触发是同一个事件的两个结果**
+- 当 `StopIteration` 被 `discharge` 捕获时，游标已经回绕到首边了
+
+**`discharge` 中的处理**（`preflowpush.py:1528-1541`）：
+```python
+# 移动到下一条边
 try:
     curr_edge.move_to_next()
 except StopIteration:
-    # 游标到达末尾，需要重标记
-    height = relabel(u)
-    # 注意：重标记后游标位置保留，下次从当前位置继续
+    # 此时游标已经通过 _rewind() 回绕到首边了！
+    # 遍历完所有边，没有找到许可边
+    # 需要重标记来创建新的许可边
+    height = relabel(u)  # 重标记会增加高度
+    
+    if is_phase1 and height >= n - 1:
+        # 第一阶段特殊处理：高度 >= n-1 的节点在 S 侧
+        levels[height].active.add(u)
+        break
+    
+    next_height = height
 ```
 
-**关键洞察**：
-- **重标记后不重置游标**！这是因为重标记增加了节点高度，原来的边可能现在变成许可边
-- 只有 `_rewind()` 会重置游标，但这个方法主要在初始化时使用
+**关键修正**：
+- ~~重标记后不重置游标~~ → **重标记发生在游标重置之后**
+- 当 `discharge` 捕获 `StopIteration` 时，游标已经通过 `_rewind()` 回绕到首边
+- 重标记操作（`height = relabel(u)`）发生在游标重置之后
+
+**为什么重标记后需要从头扫描？**
+
+重标记会增加节点高度：
+```python
+def relabel(u):
+    return min(R_nodes[v]["height"] 
+               for v, attr in R_succ[u].items()
+               if attr["flow"] < attr["capacity"]) + 1
+```
+
+重标记后，新的高度 = 邻居最小高度 + 1。这意味着：
+- 原来不满足 `height[u] == height[v] + 1` 的边，现在可能满足了
+- 之前被跳过的边（因为高度不匹配），现在可能变成许可边
+- 因此需要**从头重新扫描所有边**
+
+这解释了为什么 `move_to_next()` 在抛出 `StopIteration` 前先调用 `_rewind()`：**下一轮扫描需要从首边开始**。
 
 ### 10.5 效率提升分析
 
@@ -1607,9 +1652,9 @@ discharge(u):
 | 特性 | Preflow-Push CurrentEdge | Dinitz 指针优化 |
 |------|--------------------------|-----------------|
 | **数据结构** | 独立 `CurrentEdge` 类 | `parents` 列表 |
-| **持久化** | 跨 discharge 调用保持 | 每次 BFS 后重建 |
+| **持久化范围** | **同一扫描轮内**跨 discharge 调用保持 | 每次 BFS 后重建 |
 | **遍历方向** | 正向遍历出边 | 反向从汇点到源点 |
-| **重置时机** | 几乎不重置（除非重标记） | 每次 BFS 后完全重置 |
+| **重置时机** | 扫描轮结束时（重标记事件）自动 `_rewind()` | 每次 BFS 后完全重置 |
 | **适用场景** | 活跃节点频繁 discharge | 分层图阻塞流搜索 |
 
 **本质差异**：
